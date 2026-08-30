@@ -129,6 +129,50 @@ class BlockKVCache:
         cache._curr_chunk_idx = 0
         return cache
 
+    def prefill(self, k: Tensor, v: Tensor) -> None:
+        """Seed an empty cache with a variable-length prefix.
+
+        The prefix does not consume a logical chunk index. The next regular
+        update therefore still uses ``chunk_idx=0`` and the configured
+        ``chunk_size``. This supports models whose conditioning prefix is
+        shorter than each generated chunk.
+
+        Args:
+            k: Prefix keys matching the cache shape outside ``seq_dim``.
+            v: Prefix values matching the cache shape outside ``seq_dim``.
+        """
+        assert self._n_cached == 0 and self._prev_chunk_idx == -1, (
+            "prefill requires an empty cache"
+        )
+        assert self._curr_chunk_idx is None, (
+            "prefill cannot run between before_update() and after_update()"
+        )
+        assert k.ndim == self._k.ndim and v.ndim == self._v.ndim, (
+            "prefix rank must match the cache rank"
+        )
+        for dim in range(k.ndim):
+            if dim == self.seq_dim:
+                continue
+            assert k.shape[dim] == self._k.shape[dim], (
+                f"prefix k shape {tuple(k.shape)} does not match cache "
+                f"shape {tuple(self._k.shape)} outside seq_dim={self.seq_dim}"
+            )
+            assert v.shape[dim] == self._v.shape[dim], (
+                f"prefix v shape {tuple(v.shape)} does not match cache "
+                f"shape {tuple(self._v.shape)} outside seq_dim={self.seq_dim}"
+            )
+        prefix_size = k.shape[self.seq_dim]
+        assert prefix_size == v.shape[self.seq_dim], (
+            "prefix keys and values must have the same sequence length"
+        )
+        assert 0 < prefix_size <= self._k.shape[self.seq_dim], (
+            f"prefix_size ({prefix_size}) must be in (0, {self._k.shape[self.seq_dim]}]"
+        )
+        prefix_slice = self._seq_slice(0, prefix_size)
+        self._k[prefix_slice].copy_(k)
+        self._v[prefix_slice].copy_(v)
+        self._n_cached = prefix_size
+
     def __post_init__(self) -> None:
         assert self.k_shape[:-1] == self.v_shape[:-1], (
             "k and v must have the same shape except for the last dimension"

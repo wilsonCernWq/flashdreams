@@ -269,23 +269,33 @@ class RotaryPositionEmbedding3D(_RotaryPositionEmbedding3DBase):
         )
         self.freqs_t, self.freqs_h, self.freqs_w = self._freq_components_for_len(len_t)
 
-    def shift_t(self, autoregressive_index: int) -> Tensor:
+    def shift_t(
+        self,
+        autoregressive_index: int,
+        *,
+        temporal_offset: int = 0,
+    ) -> Tensor:
         """Shift the time dimension by ``autoregressive_index`` chunks.
 
-        The internal offset is ``autoregressive_index * len_t`` so callers
-        only need to track the AR step, not the per-chunk temporal length.
+        The internal offset is
+        ``temporal_offset + autoregressive_index * len_t``. The optional
+        offset supports an independently cached temporal prefix before the
+        generated chunks.
         If context parallelism is enabled with :meth:`set_context_parallel_group`,
         the returned frequencies are the local CP shard along sequence dim 0.
 
         Args:
             autoregressive_index: AR step index for the chunk being processed.
                 Step 0 returns the unshifted frequencies.
+            temporal_offset: Number of temporal positions cached before AR
+                step 0. Defaults to ``0``.
 
         Returns:
             Concatenated RoPE frequencies of shape ``[L, 1, 1, head_dim]``,
             where L is the sequence length T * H * W. The memory layout is (T, H, W).
         """
-        offset = autoregressive_index * self.len_t
+        assert temporal_offset >= 0, "temporal_offset must be non-negative"
+        offset = temporal_offset + autoregressive_index * self.len_t
         freqs_t = self.freqs_t + offset * self.raw_freqs_t
         freqs = self._cat_freqs(freqs_t, self.freqs_h, self.freqs_w)
         if self.is_context_parallel_enabled():

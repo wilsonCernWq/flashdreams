@@ -51,6 +51,19 @@ Wan 2.1 / Wan 2.2      Apache-2.0   https://github.com/Wan-Video/Wan2.1
     Wan-Video team. Model weights are downloaded from upstream at runtime
     and are not redistributed in this repository.
 
+CMD                    LicenseRef-NvidiaOneWayNoncommercial
+                                    https://github.com/nv-tlabs/cmd
+    The optional CMD integration implements interoperability with the published
+    Context-Matched Distillation Cosmos-Predict2.5 checkpoints. Model weights
+    and example inputs are downloaded from upstream at runtime and are not
+    redistributed in this repository.
+
+================================================================================
+Optional integration: integrations/cmd
+================================================================================
+
+mediapy                Apache-2.0   https://github.com/google/mediapy
+
 ================================================================================
 Optional integration: integrations/omnidreams
 ================================================================================

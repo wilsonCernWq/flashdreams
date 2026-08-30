@@ -202,7 +202,11 @@ class CosmosTransformer(Transformer[CosmosTransformerCache]):
         self._output_height: int | None = None
         self._output_width: int | None = None
 
-        self.network = CosmosDiTNetwork(config=config.network)
+        network = config.network.setup()
+        assert isinstance(network, CosmosDiTNetwork), (
+            "CosmosTransformerConfig.network must instantiate CosmosDiTNetwork"
+        )
+        self.network = network
         self.network = self.network.to(dtype=config.dtype)
         self.network.eval()
         self.network.set_context_parallel_group(cp_group=self._cp_group)

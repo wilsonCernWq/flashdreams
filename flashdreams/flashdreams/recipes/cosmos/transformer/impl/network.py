@@ -188,18 +188,7 @@ class CosmosDiTNetwork(nn.Module):
         self.t_embedding_norm = nn.RMSNorm(self.config.model_channels, eps=1e-6)
 
         self.blocks = nn.ModuleList(
-            [
-                Block(
-                    x_dim=self.config.model_channels,
-                    context_dim=self.config.crossattn_emb_channels,
-                    num_heads=self.config.num_heads,
-                    mlp_ratio=self.config.mlp_ratio,
-                    use_adaln_lora=self.config.use_adaln_lora,
-                    adaln_lora_dim=self.config.adaln_lora_dim,
-                    cp_method=self.config.cp_method,
-                )
-                for _ in range(self.config.num_blocks)
-            ]
+            [self._build_block() for _ in range(self.config.num_blocks)]
         )
 
         # Final layer
@@ -225,6 +214,18 @@ class CosmosDiTNetwork(nn.Module):
         self._is_shuffle_op_fused = False
         self._is_padding_mask_fused = False
         self._parameters_updated_after_loading_checkpoint = False
+
+    def _build_block(self) -> Block:
+        """Build one transformer block from the network config."""
+        return Block(
+            x_dim=self.config.model_channels,
+            context_dim=self.config.crossattn_emb_channels,
+            num_heads=self.config.num_heads,
+            mlp_ratio=self.config.mlp_ratio,
+            use_adaln_lora=self.config.use_adaln_lora,
+            adaln_lora_dim=self.config.adaln_lora_dim,
+            cp_method=self.config.cp_method,
+        )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None = None) -> None:
         for block in self.blocks:

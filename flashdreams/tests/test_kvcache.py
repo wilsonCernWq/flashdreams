@@ -161,6 +161,34 @@ def test_reset_preserves_storage_and_restores_empty_bookkeeping() -> None:
     assert cache.size == 2
 
 
+@pytest.mark.ci_cpu
+def test_prefill_seeds_variable_prefix_before_fixed_chunks() -> None:
+    """Keep a one-token prefix in a rolling cache with two-token chunks."""
+    cache = BlockKVCache(
+        k_shape=(1, 5, 1, 1),
+        v_shape=(1, 5, 1, 1),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=5,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    prefix = torch.tensor([[[[0.0]]]])
+    cache.prefill(prefix, prefix)
+
+    assert cache.size == 1
+    assert cache._prev_chunk_idx == -1
+
+    for chunk_idx, values in enumerate(((1.0, 2.0), (3.0, 4.0), (5.0, 6.0))):
+        chunk = torch.tensor(values).reshape(1, 2, 1, 1)
+        cache.before_update(chunk_idx)
+        cache.update(chunk, chunk)
+        visible = cache.cached_k().flatten().tolist()
+        cache.after_update(chunk_idx)
+
+    assert visible == [2.0, 3.0, 4.0, 5.0, 6.0]
+
+
 @pytest.fixture
 def device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,6 +325,22 @@ def test_standard_rope_indexing_changes_with_ar_index() -> None:
     rope_freqs_1 = rope.shift_t(1)
     assert rope_freqs_0.shape == rope_freqs_1.shape == (12, 1, 1, 12)
     assert not torch.equal(rope_freqs_0, rope_freqs_1)
+
+
+@pytest.mark.ci_cpu
+def test_standard_rope_accepts_independent_temporal_prefix_offset() -> None:
+    """Offset AR positions by an independently cached temporal prefix."""
+    rope = RotaryPositionEmbedding3D(
+        head_dim=12,
+        len_t=3,
+        len_h=2,
+        len_w=2,
+        interleaved=True,
+        device=torch.device("cpu"),
+    )
+    offset_chunk = rope.shift_t(0, temporal_offset=3)
+    second_chunk = rope.shift_t(1)
+    torch.testing.assert_close(offset_chunk, second_chunk)
 
 
 @pytest.mark.ci_cpu
