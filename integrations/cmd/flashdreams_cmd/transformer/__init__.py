@@ -35,6 +35,11 @@ from flashdreams.recipes.cosmos.transformer.impl.network import (
     state_dict_transform,
 )
 
+from .native_fp8 import (
+    NativeAccelerationMode,
+    NativeFP8Unavailable,
+    resolve_native_fp8,
+)
 from .network import CMDDiTNetwork, CMDDiTNetworkConfig
 
 __all__ = [
@@ -42,6 +47,9 @@ __all__ = [
     "CMDTransformer",
     "CMDTransformerCache",
     "CMDTransformerConfig",
+    "NativeAccelerationMode",
+    "NativeFP8Unavailable",
+    "resolve_native_fp8",
     "state_dict_transform",
 ]
 
@@ -75,6 +83,15 @@ class CMDTransformerConfig(CosmosTransformerConfig):
 
     prefix_len_t: int = 1
     """Independent I2V prefix length. Released CMD checkpoints use ``1``."""
+
+    native_dit_acceleration: NativeAccelerationMode = "disabled"
+    """Native CUTLASS FP8 DiT path (``integrations/cmd/docs/native_fp8_port_plan.md``).
+
+    ``disabled`` (default) never probes for the extension. ``auto`` uses it when
+    the model and GPU both qualify and falls back with a logged reason otherwise.
+    ``required`` raises :class:`NativeFP8Unavailable` instead of falling back.
+    The kernels are ``sm_120a``-only; see :mod:`.native_fp8` for why the
+    preconditions are hard refusals rather than best-effort attempts."""
 
 
 class CMDTransformer(CosmosTransformer):
