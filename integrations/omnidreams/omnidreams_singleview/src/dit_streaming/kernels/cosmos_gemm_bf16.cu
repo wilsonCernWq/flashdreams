@@ -22,6 +22,8 @@
 // for large M, 128×128×32 for small M) so the bf16 path inherits the same
 // large-M / small-M tuning the WAN team converged on.
 
+#include <cstdio>
+
 #include "cosmos_block.cuh"
 
 #include "cutlass/cutlass.h"
@@ -40,6 +42,24 @@ namespace {
 // Same threshold heuristic as `cutlass_linear_layer_rrr` in `ops.cu`:
 // large M -> 256x128x32, small M -> 128x128x32.
 constexpr int k_cosmos_gemm_tile_threshold = 1024;
+
+// Translate a failed CUTLASS status into the most informative cudaError_t we
+// can, instead of a blanket cudaErrorUnknown.
+//
+// This matters more than it looks: when the extension is built for the wrong
+// architecture, the launch fails with cudaErrorNoKernelImageForDevice (209),
+// but collapsing that to "unknown error" hides the one fact that identifies the
+// problem. Prefer any pending CUDA error, and always log the CUTLASS status so
+// the reason survives even when the caller only propagates an error code.
+inline cudaError_t cosmos_gemm_cutlass_error(cutlass::Status status, const char* where) {
+  cudaError_t pending = cudaGetLastError();
+  std::fprintf(stderr,
+               "[omnidreams] %s: cutlass::Status=%d '%s'; pending CUDA error=%d '%s'\n",
+               where, static_cast<int>(status),
+               cutlass::cutlassGetStatusString(status),
+               static_cast<int>(pending), cudaGetErrorString(pending));
+  return pending != cudaSuccess ? pending : cudaErrorUnknown;
+}
 } // namespace
 
 template <typename ElementOutput_, int ElementsPerAccess, typename ElementAccumulator_, typename ElementCompute_>
@@ -182,7 +202,7 @@ cudaError_t cutlass_linear_layer_rrr_bf16(
         {output_row, out_features},
         {ElementOutput(1.0f), beta});
     status = gemm_op.initialize(args, nullptr);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
     status = gemm_op(stream);
   } else {
     using Gemm = cutlass::gemm::device::Gemm<
@@ -203,11 +223,12 @@ cudaError_t cutlass_linear_layer_rrr_bf16(
         {output_row, out_features},
         {ElementOutput(1.0f), beta});
     status = gemm_op.initialize(args, nullptr);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
     status = gemm_op(stream);
   }
 
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +277,7 @@ cudaError_t cutlass_linear_layer_rrr_bf16_prepared(
         {output_row, out_features},
         {ElementOutput(1.0f), beta});
     status = gemm_op.initialize(args, nullptr);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
     status = gemm_op(stream);
   } else {
     using Gemm = cutlass::gemm::device::Gemm<
@@ -277,11 +298,12 @@ cudaError_t cutlass_linear_layer_rrr_bf16_prepared(
         {output_row, out_features},
         {ElementOutput(1.0f), beta});
     status = gemm_op.initialize(args, nullptr);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
     status = gemm_op(stream);
   }
 
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,9 +357,10 @@ cudaError_t cutlass_linear_layer_rrr_gelu_bf16(
       epilogue_params);
 
   cutlass::Status status = gemm_op.initialize(args, nullptr);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
   status = gemm_op(stream);
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 // ---------------------------------------------------------------------------
@@ -391,9 +414,10 @@ cudaError_t cutlass_linear_layer_rrr_gelu_bf16_prepared(
       epilogue_params);
 
   cutlass::Status status = gemm_op.initialize(args, nullptr);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
   status = gemm_op(stream);
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 cudaError_t cutlass_linear_layer_rrr_bf16_prepared_gated_residual(
@@ -460,9 +484,10 @@ cudaError_t cutlass_linear_layer_rrr_bf16_prepared_gated_residual(
       int64_t(0));
 
   cutlass::Status status = gemm_op.initialize(args, nullptr);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
   status = gemm_op(stream);
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,9 +542,10 @@ cudaError_t cutlass_linear_layer_rrr_silu_bf16(
       {1.0f, 1.0f});
 
   cutlass::Status status = gemm_op.initialize(args, nullptr);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (status != cutlass::Status::kSuccess) return cosmos_gemm_cutlass_error(status, __func__);
   status = gemm_op(stream);
-  return (status == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+  return (status == cutlass::Status::kSuccess) ? cudaSuccess
+                                              : cosmos_gemm_cutlass_error(status, __func__);
 }
 
 } // namespace omnidreams_singleview

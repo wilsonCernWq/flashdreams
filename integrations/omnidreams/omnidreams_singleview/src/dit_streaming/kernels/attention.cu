@@ -1160,6 +1160,7 @@ cudaError_t run_cudnn_fmha_packed_qkv(
     float attn_scale = (scale > 0.f) ? scale : (1.0f / sqrtf(float(D)));
     auto sdpa_opts = fe::graph::SDPA_attributes()
                          .set_name("packed_sdpa")
+                         .set_generate_stats(false)
                          .set_attn_scale(attn_scale)
                          .set_causal_mask(causal);
 
@@ -1526,6 +1527,7 @@ static cudaError_t run_self_attention_cudnn_impl(
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("sdpa_self_attention")
+                            .set_generate_stats(false)
                             .set_attn_scale(attn_scale);
 
     // Create SDPA operation
@@ -1766,6 +1768,7 @@ static cudaError_t run_cross_attention_cudnn(const AttentionDeviceParamsT<Weight
     float attn_scale = 1.0f / sqrtf(static_cast<float>(D));
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("sdpa_cross_attention")
+                            .set_generate_stats(false)
                             .set_attn_scale(attn_scale);
 
     // Create SDPA operation
@@ -2056,6 +2059,7 @@ static cudaError_t run_cross_attention_i2v_cudnn(const CrossAttentionI2VParamsT<
       float attn_scale = 1.0f / sqrtf(static_cast<float>(D));
       auto sdpa_options = fe::graph::SDPA_attributes()
                               .set_name("sdpa_cross_attention_i2v")
+                              .set_generate_stats(false)
                               .set_attn_scale(attn_scale);
 
       auto [O, Stats] = graph->sdpa(Q, K_t, V_t, sdpa_options);

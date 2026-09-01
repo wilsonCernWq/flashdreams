@@ -666,6 +666,15 @@ struct CosmosSm120PerColScaleEltActNoSrcCallbacks
     using Impl::Impl;
 };
 
+// NOTE ON ARCH TAGS: `cutlass::arch::Sm120` below is also the correct tag for
+// sm_121 (GB10 / DGX Spark). CUTLASS deliberately ships no `arch::Sm121` --
+// "Support for Blackwell SM121 kernels for DGX Spark GPUs. Share the major
+// codes with Blackwell SM120 kernels" (3rdparty/cutlass/CHANGELOG.md:48-49).
+// These kernels are measured producing correct numerics on cc-12.1. If sm_121
+// appears broken, the cause is the *build's* arch list, not this tag: an
+// `a`-suffixed cubin has no forward compatibility, so a 12.0a-only build yields
+// no runnable image on a 12.1 device. See integrations/omnidreams/docs/
+// multi_arch_support.md.
 namespace sm120_fp8_rcr_bias {
     // D = alpha * (A @ B) + bias
     using namespace cute;
