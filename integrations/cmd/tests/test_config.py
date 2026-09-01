@@ -84,6 +84,7 @@ def test_released_presets_match_cmd_temporal_geometry() -> None:
         "cmd-chunk1-short-i2v": (1, 23, 24, 21, False),
         "cmd-chunk1-long-i2v": (1, 125, 126, 21, False),
         "cmd-chunk4-short-i2v": (4, 5, 21, 16, False),
+        "cmd-chunk4-short-i2v-fp8": (4, 5, 21, 16, False),
         "cmd-chunk4-long-i2v": (4, 30, 121, 16, False),
         "cmd-chunk1-camera-i2v": (1, 31, 32, 21, True),
         "cmd-chunk4-camera-i2v": (4, 7, 29, 24, True),

@@ -130,6 +130,28 @@ RUNNER_CMD_CHUNK4_SHORT = CMDRunnerConfig(
     num_chunks=5,
 )
 
+PIPELINE_CMD_CHUNK4_SHORT_FP8 = derive_config(
+    PIPELINE_CMD_CHUNK4_SHORT,
+    name="cmd-chunk4-short-i2v-fp8",
+    diffusion_model=dict(
+        transformer=dict(weight_quantization="fp8"),
+    ),
+)
+"""A/B twin of ``cmd-chunk4-short-i2v`` with FP8 block linears.
+
+Differs from its base in exactly one field, so a side-by-side run isolates the
+effect of quantization. FP8 only pays off under ``torch.compile`` (which this
+preset inherits as ``compile_network=True``); in eager mode the per-call
+activation quantization makes it slower than bf16.
+"""
+
+RUNNER_CMD_CHUNK4_SHORT_FP8 = CMDRunnerConfig(
+    runner_name=PIPELINE_CMD_CHUNK4_SHORT_FP8.name,
+    description="CMD chunk-4 short I2V with FP8 block linears (A/B against the bf16 twin).",
+    pipeline=PIPELINE_CMD_CHUNK4_SHORT_FP8,
+    num_chunks=5,
+)
+
 PIPELINE_CMD_CHUNK4_LONG = derive_config(
     PIPELINE_CMD_CHUNK4_SHORT,
     name="cmd-chunk4-long-i2v",
@@ -193,6 +215,7 @@ CMD_CONFIGS: dict[str, CMDInferencePipelineConfig] = {
         PIPELINE_CMD_CHUNK1_SHORT,
         PIPELINE_CMD_CHUNK1_LONG,
         PIPELINE_CMD_CHUNK4_SHORT,
+        PIPELINE_CMD_CHUNK4_SHORT_FP8,
         PIPELINE_CMD_CHUNK4_LONG,
         PIPELINE_CMD_CHUNK1_CAMERA,
         PIPELINE_CMD_CHUNK4_CAMERA,
@@ -206,6 +229,7 @@ RUNNER_CONFIGS: dict[str, RunnerConfig] = {
         RUNNER_CMD_CHUNK1_SHORT,
         RUNNER_CMD_CHUNK1_LONG,
         RUNNER_CMD_CHUNK4_SHORT,
+        RUNNER_CMD_CHUNK4_SHORT_FP8,
         RUNNER_CMD_CHUNK4_LONG,
         RUNNER_CMD_CHUNK1_CAMERA,
         RUNNER_CMD_CHUNK4_CAMERA,

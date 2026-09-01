@@ -42,6 +42,7 @@ dev = [
 "cmd-chunk1-short-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK1_SHORT"
 "cmd-chunk1-long-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK1_LONG"
 "cmd-chunk4-short-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK4_SHORT"
+"cmd-chunk4-short-i2v-fp8" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK4_SHORT_FP8"
 "cmd-chunk4-long-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK4_LONG"
 "cmd-chunk1-camera-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK1_CAMERA"
 "cmd-chunk4-camera-i2v" = "flashdreams_cmd.config:RUNNER_CMD_CHUNK4_CAMERA"
