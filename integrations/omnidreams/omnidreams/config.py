@@ -465,46 +465,6 @@ RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF = OmnidreamsRunnerConfig(
     prompt=_DEFAULT_PROMPT_1V,
 )
 
-SV_2STEPS_CHUNK2_NATIVE_DIT_BF16 = derive_config(
-    SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
-    name="omnidreams-native-dit-bf16",
-    diffusion_model=dict(
-        transformer=dict(
-            native_dit_acceleration="required",
-            native_dit_backend="bf16",
-        ),
-    ),
-)
-"""Native CUTLASS DiT, BF16 backend -- the A/B baseline for the FP8 twin below.
-
-``required`` rather than ``auto`` on purpose: a silent fallback to the PyTorch
-path would make the comparison meaningless.
-"""
-
-SV_2STEPS_CHUNK2_NATIVE_DIT_FP8 = derive_config(
-    SV_2STEPS_CHUNK2_NATIVE_DIT_BF16,
-    name="omnidreams-native-dit-fp8",
-    diffusion_model=dict(
-        transformer=dict(native_dit_backend="fp8_kvcache_cudnn"),
-    ),
-)
-"""Native CUTLASS DiT, FP8 + quantized KV cache. Differs from its BF16 twin in
-exactly one field, so an end-to-end A/B isolates the effect of FP8."""
-
-RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_BF16 = OmnidreamsRunnerConfig(
-    runner_name=SV_2STEPS_CHUNK2_NATIVE_DIT_BF16.name,
-    description="Omnidreams with the native CUTLASS DiT, BF16 (A/B baseline).",
-    pipeline=SV_2STEPS_CHUNK2_NATIVE_DIT_BF16,
-    prompt=_DEFAULT_PROMPT_1V,
-)
-
-RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_FP8 = OmnidreamsRunnerConfig(
-    runner_name=SV_2STEPS_CHUNK2_NATIVE_DIT_FP8.name,
-    description="Omnidreams with the native CUTLASS DiT, FP8 + quantized KV cache.",
-    pipeline=SV_2STEPS_CHUNK2_NATIVE_DIT_FP8,
-    prompt=_DEFAULT_PROMPT_1V,
-)
-
 RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_NATIVE_PERF = OmnidreamsRunnerConfig(
     runner_name=SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_NATIVE_PERF.name,
     description=(
@@ -609,8 +569,6 @@ OMNIDREAMS_RUNNERS: dict[str, RunnerConfig] = {
     for cfg in (
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE,
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
-        RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_BF16,
-        RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_FP8,
     )
 }
 """All shipped Omnidreams runners (single- and multi-view variants),
