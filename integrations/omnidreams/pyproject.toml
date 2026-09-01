@@ -119,6 +119,8 @@ interactive-drive-configuration = "omnidreams.interactive_drive.input_config.app
 [project.entry-points."flashdreams.runner_configs"]
 "omnidreams" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE"
 "omnidreams-perf" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF"
+"omnidreams-native-dit-bf16" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_BF16"
+"omnidreams-native-dit-fp8" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_FP8"
 
 [tool.setuptools.packages.find]
 include = ["omnidreams*"]
