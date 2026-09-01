@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +29,11 @@ from flashdreams.core.attention.rope import (
     RotaryPositionEmbedding3D,
 )
 from flashdreams.core.checkpoint.load import load_checkpoint
+from flashdreams.core.quant import (
+    TorchScaledMMFP4Recipe,
+    TorchScaledMMFP8Recipe,
+    replace_linear_with_quant,
+)
 from flashdreams.infra.acceleration.cuda_graph_dispatch import (
     CUDAGraphDispatch,
     cuda_graph_capture_ar_index,
@@ -148,6 +153,12 @@ class CosmosTransformerConfig(TransformerConfig):
     compile_network: bool = True
     """``torch.compile`` the network."""
 
+    weight_quantization: Literal["none", "fp8", "fp4"] = "none"
+    """Post-checkpoint-load ``nn.Linear`` weight quantization via
+    ``torch._scaled_mm`` (see ``integrations/cmd/docs/quantization_plan.md``).
+    Applied after ``update_parameters_after_loading_checkpoint()`` and before
+    ``compile_module()``; opt-in, default keeps full-precision weights."""
+
     use_cuda_graph: bool = True
     """Wrap in ``CUDAGraphWrapper`` for steady-state replay. Caller must
     keep non-staged inputs at stable storage addresses across calls."""
@@ -170,6 +181,19 @@ class CosmosTransformerConfig(TransformerConfig):
     def requires_negative_text_embeddings(self) -> bool:
         """Whether cache initialization must receive negative text embeddings."""
         return self.guidance_scale > 1.0
+
+
+_COSMOS_WEIGHT_QUANTIZATION_SKIP_PATTERNS: tuple[str, ...] = (
+    r"x_embedder",
+    r"t_embedder",
+    r"t_embedding_norm",
+    r"final_layer",
+    r"adaln_modulation_",
+    r"cam_encoder",
+)
+"""Linear submodules excluded from ``weight_quantization``: embedders, AdaLN
+modulation projections, and the final output layer (small, precision-sensitive,
+or not guaranteed 16-divisible), plus CMD's camera encoder (small, CMD-only)."""
 
 
 class CosmosTransformer(Transformer[CosmosTransformerCache]):
@@ -217,6 +241,24 @@ class CosmosTransformer(Transformer[CosmosTransformerCache]):
                 state_dict = config.state_dict_transform(state_dict)
             self.network.load_state_dict(state_dict)
         self.network.update_parameters_after_loading_checkpoint()
+
+        if config.weight_quantization != "none":
+            recipe = (
+                TorchScaledMMFP8Recipe()
+                if config.weight_quantization == "fp8"
+                else TorchScaledMMFP4Recipe()
+            )
+            converted, skipped = replace_linear_with_quant(
+                self.network,
+                recipe=recipe,
+                params_dtype=config.dtype,
+                skip_patterns=_COSMOS_WEIGHT_QUANTIZATION_SKIP_PATTERNS,
+            )
+            if converted <= 0:
+                raise RuntimeError(
+                    f"weight_quantization={config.weight_quantization!r} converted no "
+                    f"Linear layers; skipped={skipped}."
+                )
 
         if config.compile_network:
             self.network = compile_module(self.network)
