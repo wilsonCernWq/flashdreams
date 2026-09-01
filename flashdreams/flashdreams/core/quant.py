@@ -282,14 +282,14 @@ class TorchScaledMMFP8Linear(nn.Module):
     def __init__(
         self,
         *,
-        weight: torch.Tensor,
+        weight: torch.Tensor | None,
         weight_fp8: torch.Tensor,
         weight_scale: torch.Tensor,
         bias: torch.Tensor | None,
         out_dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        if weight.shape != weight_fp8.shape:
+        if weight is not None and weight.shape != weight_fp8.shape:
             raise ValueError(
                 "weight and weight_fp8 must have matching shape, got "
                 f"{tuple(weight.shape)} and {tuple(weight_fp8.shape)}."
@@ -308,7 +308,15 @@ class TorchScaledMMFP8Linear(nn.Module):
         self.out_features = int(weight_fp8.shape[0])
         self.in_features = int(weight_fp8.shape[1])
         self.out_dtype = out_dtype
-        self.register_buffer("weight", weight.detach().contiguous())
+        # The source bf16 weight is dead in inference -- forward() reads only
+        # weight_fp8. It is kept by default because SANA-WM's stage1_model reads
+        # `.weight` off quantized layers (`output_gate.weight` as a tensor,
+        # `proj.weight.dtype`). Callers that do not can drop it and save a full
+        # high-precision copy per quantized linear.
+        if weight is None:
+            self.register_buffer("weight", None)
+        else:
+            self.register_buffer("weight", weight.detach().contiguous())
         self.register_buffer("weight_fp8", weight_fp8.contiguous())
         self.register_buffer(
             "weight_scale", weight_scale.to(torch.float32).contiguous()
@@ -324,8 +332,14 @@ class TorchScaledMMFP8Linear(nn.Module):
         source: nn.Linear,
         *,
         out_dtype: torch.dtype,
+        keep_source_weight: bool = True,
     ) -> "TorchScaledMMFP8Linear":
-        """Create an FP8 replacement from a source ``nn.Linear``."""
+        """Create an FP8 replacement from a source ``nn.Linear``.
+
+        ``keep_source_weight=False`` discards the original high-precision
+        weight, which forward() never reads. Saves one full-precision copy per
+        layer; only safe when nothing reaches for ``.weight`` on the result.
+        """
         _require_fp8_dtype()
         weight_f32 = source.weight.detach().to(torch.float32)
         weight_scale = (
@@ -339,7 +353,11 @@ class TorchScaledMMFP8Linear(nn.Module):
         ).to(torch.float8_e4m3fn)
         bias = source.bias.detach() if source.bias is not None else None
         replacement = cls(
-            weight=source.weight.detach().to(device=source.weight.device),
+            weight=(
+                source.weight.detach().to(device=source.weight.device)
+                if keep_source_weight
+                else None
+            ),
             weight_fp8=weight_fp8.to(device=source.weight.device),
             weight_scale=weight_scale.to(device=source.weight.device),
             bias=bias.to(device=source.weight.device) if bias is not None else None,
@@ -598,8 +616,14 @@ def replace_linear_with_quant(
     skip_patterns: tuple[str, ...],
     include_patterns: tuple[str, ...] | None = None,
     prefix: str = "",
+    keep_source_weight: bool = True,
 ) -> tuple[int, int]:
-    """Replace eligible ``nn.Linear`` modules with the requested backend."""
+    """Replace eligible ``nn.Linear`` modules with the requested backend.
+
+    ``keep_source_weight=False`` frees the original high-precision weights,
+    which the quantized forward never reads. Only pass it when nothing in the
+    model reaches for ``.weight`` on a replaced layer.
+    """
     return _replace_linear_with_quant(
         module,
         recipe=recipe,
@@ -607,6 +631,7 @@ def replace_linear_with_quant(
         skip_patterns=skip_patterns,
         include_patterns=include_patterns,
         prefix=prefix,
+        keep_source_weight=keep_source_weight,
     )
 
 
@@ -618,6 +643,7 @@ def _replace_linear_with_quant(
     skip_patterns: tuple[str, ...],
     include_patterns: tuple[str, ...] | None,
     prefix: str,
+    keep_source_weight: bool = True,
 ) -> tuple[int, int]:
     converted = 0
     skipped = 0
@@ -648,6 +674,7 @@ def _replace_linear_with_quant(
                 replacement = TorchScaledMMFP8Linear.from_linear(
                     child,
                     out_dtype=out_dtype,
+                    keep_source_weight=keep_source_weight,
                 )
             elif recipe.precision == "fp4":
                 replacement = TorchScaledMMFP4Linear.from_linear(
@@ -669,6 +696,7 @@ def _replace_linear_with_quant(
             skip_patterns=skip_patterns,
             include_patterns=include_patterns,
             prefix=child_prefix,
+            keep_source_weight=keep_source_weight,
         )
         converted += child_converted
         skipped += child_skipped

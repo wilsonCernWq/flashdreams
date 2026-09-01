@@ -253,6 +253,10 @@ class CosmosTransformer(Transformer[CosmosTransformerCache]):
                 recipe=recipe,
                 params_dtype=config.dtype,
                 skip_patterns=_COSMOS_WEIGHT_QUANTIZATION_SKIP_PATTERNS,
+                # Nothing in the Cosmos block reads `.weight` off a replaced
+                # linear, so the source bf16 copy is pure overhead here: keeping
+                # it measured +1.8 GiB on a 28-block CMD rollout.
+                keep_source_weight=False,
             )
             if converted <= 0:
                 raise RuntimeError(
