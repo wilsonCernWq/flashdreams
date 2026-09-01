@@ -38,6 +38,7 @@ from flashdreams.recipes.wan.autoencoder.vae import (
 )
 
 from .camera import build_camera_conditioning
+from .encoder import CMDCamCtrlInput, CMDLiveCameraEncoder
 from .transformer import CMDTransformerCache, CMDTransformerConfig
 
 
@@ -107,6 +108,11 @@ class CMDInferencePipeline(
         """Whether this variant requires a camera trajectory."""
         return self._cmd_transformer_config.network.camera_dim is not None
 
+    @property
+    def _live_camera_encoder(self) -> bool:
+        """Whether this pipeline is wired for per-step live camera input."""
+        return isinstance(self.encoder, CMDLiveCameraEncoder)
+
     @torch.no_grad()
     def initialize_cache(
         self,
@@ -165,7 +171,7 @@ class CMDInferencePipeline(
         latent_width = pixel_width // spatial_ratio
 
         camera_condition: Tensor | None = None
-        if self.camera_conditioned:
+        if self.camera_conditioned and not self._live_camera_encoder:
             if camera_to_world is None or intrinsics is None:
                 raise ValueError(
                     "camera-conditioned CMD requires camera_to_world and intrinsics"
@@ -181,9 +187,21 @@ class CMDInferencePipeline(
                 expected_latent_frames=expected_latent_frames,
                 output_dtype=self._cmd_transformer_config.dtype,
             )
+        elif self._live_camera_encoder:
+            if camera_to_world is not None or intrinsics is not None:
+                raise ValueError(
+                    "live camera-conditioned CMD does not take a fixed camera "
+                    "trajectory; camera comes from per-step live input"
+                )
+            assert isinstance(self.encoder, CMDLiveCameraEncoder)
+            # CMD's independent first-frame prefix is prefilled once here,
+            # separately from the per-step tokens produced by `generate()`;
+            # it needs its own (identity-pose) camera token too.
+            camera_condition = self.encoder.prefix_camera_tokens(device=self.device)
         elif camera_to_world is not None or intrinsics is not None:
             raise ValueError("camera inputs were provided to a non-camera CMD variant")
 
+        encoder_context = {"device": self.device} if self._live_camera_encoder else {}
         parent = super().initialize_cache(
             transformer_context={
                 "height": latent_height,
@@ -193,6 +211,7 @@ class CMDInferencePipeline(
                 "image_embeddings": image_embeddings,
                 "camera_condition": camera_condition,
             },
+            encoder_context=encoder_context,
         )
         assert isinstance(parent.transformer_cache, CMDTransformerCache)
         return CMDInferencePipelineCache(
@@ -208,8 +227,19 @@ class CMDInferencePipeline(
         self,
         autoregressive_index: int,
         cache: CMDInferencePipelineCache,
+        input: CMDCamCtrlInput | None = None,
     ) -> Tensor:
-        """Generate and decode one CMD autoregressive chunk."""
+        """Generate and decode one CMD autoregressive chunk.
+
+        Args:
+            autoregressive_index: This AR step's index.
+            cache: The rollout cache from :meth:`initialize_cache`.
+            input: Optional live camera payload for this step, consumed only
+                when the pipeline is wired with a
+                :class:`~.encoder.CMDLiveCameraEncoder`. Ignored (must be
+                ``None``) for every other rollout, which conditions on
+                ``cache.camera_condition`` instead.
+        """
         previous = cache.autoregressive_index
         expected = previous + 1 if previous is not None else 0
         if autoregressive_index != expected:
@@ -224,7 +254,28 @@ class CMDInferencePipeline(
             cache.event_profiler = events
 
         camera_chunk: Tensor | None = None
-        if cache.camera_condition is not None:
+        if self._live_camera_encoder:
+            if input is None:
+                raise ValueError(
+                    "this pipeline is wired with a CMDLiveCameraEncoder, which "
+                    "requires a per-step CMDCamCtrlInput on every generate() call"
+                )
+            if self.encoder is None or cache.encoder_cache is None:
+                raise RuntimeError(
+                    "live camera input was provided but no camera encoder is configured"
+                )
+            camera_chunk = self.encoder(
+                input=input,
+                autoregressive_index=autoregressive_index,
+                cache=cache.encoder_cache,
+            )
+        elif input is not None:
+            raise ValueError(
+                "a live camera input was provided, but this pipeline is not "
+                "wired with a CMDLiveCameraEncoder; camera conditioning comes "
+                "from cache.camera_condition instead"
+            )
+        elif cache.camera_condition is not None:
             if self.encoder is None or cache.encoder_cache is None:
                 raise RuntimeError(
                     "camera condition exists without a configured encoder cache"

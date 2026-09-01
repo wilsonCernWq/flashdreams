@@ -24,9 +24,10 @@ description = "CMD causal Cosmos-Predict2.5 I2V inference integration for FlashD
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "flashdreams",
+    "flashdreams[serving]",
     "mediapy>=1.1",
     "numpy>=1.24",
+    "opencv-python-headless>=4.5",
 ]
 
 [tool.uv.sources]
@@ -48,6 +49,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["flashdreams_cmd*"]
 exclude = ["tests"]
+
+[tool.setuptools.package-data]
+"flashdreams_cmd.webrtc.web" = ["adapter.js"]
 
 [tool.uv]
 managed = true

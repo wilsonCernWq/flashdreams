@@ -17,26 +17,27 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
-import numpy as np
-import torch
-from loguru import logger
-
+import tyro
 from flashdreams.infra.postprocess import VideoTensorLayout
 from flashdreams.infra.runner import Runner, RunnerConfig
 from flashdreams.infra.runner_io import (
-    load_first_frame_tensor,
-    read_image_rgb,
-    resolve_input_path,
     resolve_prompt_value,
     runner_artifact_path,
     write_runner_stats,
 )
 from flashdreams.runtime.video_output import Mp4VideoOutputTarget
+from loguru import logger
 
+from .inputs import (
+    CMD_CACHE_DIR,
+    load_cmd_camera,
+    load_cmd_image,
+    resolve_total_latent_frames,
+)
 from .pipeline import CMDInferencePipeline, CMDInferencePipelineCache
 
 DEFAULT_PROMPT = (
@@ -59,18 +60,16 @@ DEFAULT_IMAGE_URL = f"{_RAW_EXAMPLE_ROOT}/image.png"
 DEFAULT_CAMERA_IMAGE_URL = f"{_RAW_EXAMPLE_ROOT}/camera_image.png"
 DEFAULT_CAMERA_URL = f"{_RAW_EXAMPLE_ROOT}/camera.npz"
 
-CMD_CACHE_DIR = (
-    Path(os.path.expanduser(os.getenv("FLASHDREAMS_CACHE_DIR", "~/.cache/flashdreams")))
-    / "cmd"
-)
-"""User-writable cache for CMD example inputs."""
-
 
 @dataclass(kw_only=True)
 class CMDRunnerConfig(RunnerConfig):
     """CLI configuration shared by all released CMD variants."""
 
-    _target: type["CMDRunner"] = field(default_factory=lambda: CMDRunner)
+    _target: type[CMDRunner] = field(default_factory=lambda: CMDRunner)
+
+    launch_capability: Annotated[str | None, tyro.conf.Suppress] = (
+        "flashdreams_cmd.launch:LAUNCH_CAPABILITY"
+    )
 
     prompt: str | Path = DEFAULT_PROMPT
     """Inline prompt or path to a text file."""
@@ -106,79 +105,32 @@ class CMDRunner(Runner[CMDRunnerConfig, CMDInferencePipeline]):
     def total_latent_frames(self) -> int:
         """Total latent frames including CMD's independent image prefix."""
         transformer = self.pipeline._cmd_transformer_config
-        return transformer.prefix_len_t + self.config.num_chunks * transformer.len_t
-
-    def _load_image(self) -> torch.Tensor:
-        """Resolve, resize, and normalize the first-frame image."""
-        path = resolve_input_path(
-            self.config.image_path,
-            cache_dir=CMD_CACHE_DIR,
-            validator=read_image_rgb,
-        )
-        return load_first_frame_tensor(
-            path,
-            pixel_height=self.config.pixel_height,
-            pixel_width=self.config.pixel_width,
-            device=self.pipeline.device,
-            dtype=torch.bfloat16,
-        )
-
-    def _load_camera(self) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Load and trim CMD's pixel-rate camera trajectory."""
-        camera_path = self.config.camera_path
-        if camera_path is None:
-            if self.pipeline.camera_conditioned:
-                raise ValueError(
-                    "This CMD variant requires --camera-path with a camera .npz"
-                )
-            return None
-        if not self.pipeline.camera_conditioned:
-            raise ValueError("--camera-path is only valid for camera CMD variants")
-
-        path = resolve_input_path(camera_path, cache_dir=CMD_CACHE_DIR)
-        with np.load(path, allow_pickle=False) as payload:
-            try:
-                world_to_camera = np.asarray(
-                    payload["target_w2c"],
-                    dtype=np.float32,
-                )
-                intrinsics = np.asarray(
-                    payload["target_intrinsics"],
-                    dtype=np.float32,
-                )
-            except KeyError as error:
-                raise ValueError(
-                    "camera .npz must contain target_w2c and target_intrinsics"
-                ) from error
-
-        pixel_frames = 1 + (self.total_latent_frames - 1) * (
-            self.pipeline.config.camera_frame_stride
-        )
-        if (
-            world_to_camera.shape[0] < pixel_frames
-            or intrinsics.shape[0] < pixel_frames
-        ):
-            raise ValueError(
-                f"camera input needs {pixel_frames} pixel frames for "
-                f"{self.total_latent_frames} latent frames"
-            )
-        camera_to_world = np.linalg.inv(world_to_camera[:pixel_frames]).astype(
-            np.float32
-        )
-        return (
-            torch.from_numpy(camera_to_world),
-            torch.from_numpy(intrinsics[:pixel_frames]),
+        return resolve_total_latent_frames(
+            prefix_len_t=transformer.prefix_len_t,
+            len_t=transformer.len_t,
+            num_chunks=self.config.num_chunks,
         )
 
     def _initialize_cache(self) -> CMDInferencePipelineCache:
         """Load rollout inputs and initialize all component caches."""
         if self.config.num_chunks <= 0:
             raise ValueError("num_chunks must be positive")
-        camera = self._load_camera()
+        camera = load_cmd_camera(
+            self.config.camera_path,
+            camera_conditioned=self.pipeline.camera_conditioned,
+            total_latent_frames=self.total_latent_frames,
+            camera_frame_stride=self.pipeline.config.camera_frame_stride,
+        )
         camera_to_world, intrinsics = camera if camera is not None else (None, None)
+        image = load_cmd_image(
+            self.config.image_path,
+            pixel_height=self.config.pixel_height,
+            pixel_width=self.config.pixel_width,
+            device=self.pipeline.device,
+        )
         return self.pipeline.initialize_cache(
             text=[resolve_prompt_value(self.config.prompt)],
-            image=self._load_image(),
+            image=image,
             camera_to_world=camera_to_world,
             intrinsics=intrinsics,
             expected_latent_frames=(
@@ -237,11 +189,12 @@ class CMDRunner(Runner[CMDRunnerConfig, CMDInferencePipeline]):
 
 
 __all__ = [
-    "CMDRunner",
-    "CMDRunnerConfig",
+    "CMD_CACHE_DIR",
     "DEFAULT_CAMERA_IMAGE_URL",
     "DEFAULT_CAMERA_PROMPT",
     "DEFAULT_CAMERA_URL",
     "DEFAULT_IMAGE_URL",
     "DEFAULT_PROMPT",
+    "CMDRunner",
+    "CMDRunnerConfig",
 ]

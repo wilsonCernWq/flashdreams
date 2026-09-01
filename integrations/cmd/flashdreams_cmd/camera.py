@@ -151,6 +151,21 @@ def camera_rays(
     return torch.cat((ray_origin, ray_direction), dim=-1)
 
 
+def _rays_to_camera_tokens(
+    rays: Tensor,
+    *,
+    patch_size: int,
+    output_dtype: torch.dtype,
+) -> Tensor:
+    """Patchify per-pixel ray channels into DiT-token-grid camera tokens."""
+    return rearrange(
+        rays,
+        "... t (h ph) (w pw) c -> ... t (c ph pw) h w",
+        ph=patch_size,
+        pw=patch_size,
+    ).to(dtype=output_dtype)
+
+
 def build_camera_conditioning(
     camera_to_world: Tensor,
     intrinsics: Tensor,
@@ -215,9 +230,112 @@ def build_camera_conditioning(
         image_height=image_height,
         image_width=image_width,
     )
-    return rearrange(
-        rays,
-        "... t (h ph) (w pw) c -> ... t (c ph pw) h w",
-        ph=patch_size,
-        pw=patch_size,
-    ).to(dtype=output_dtype)
+    return _rays_to_camera_tokens(
+        rays, patch_size=patch_size, output_dtype=output_dtype
+    )
+
+
+def incremental_camera_conditioning(
+    camera_to_world: Tensor,
+    intrinsics: Tensor,
+    *,
+    anchor_pose: Tensor,
+    image_height: int,
+    image_width: int,
+    len_t: int,
+    frame_stride: int = 4,
+    patch_size: int = 16,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[Tensor, Tensor]:
+    """Build one AR chunk's camera tokens incrementally, carrying the block anchor.
+
+    Reproduces exactly what a full :func:`build_camera_conditioning` call
+    would produce for this chunk's latent frames, without needing the whole
+    trajectory materialized upfront. Assumes ``prefix_len_t == 1`` (true for
+    all six released CMD presets); callers must assert this explicitly.
+
+    Args:
+        camera_to_world: This chunk's newly-arrived, dense pixel-rate poses,
+            shaped ``[..., len_t * frame_stride, 4, 4]`` -- exactly the
+            frames generated in this AR step, no anchor/prefix frame
+            included.
+        intrinsics: ``[..., 3, 3]`` or ``[..., len_t * frame_stride, 3, 3]``,
+            aligned with ``camera_to_world``.
+        anchor_pose: ``[..., 1, 4, 4]`` raw absolute pose of the frame
+            immediately preceding this chunk -- either the previous chunk's
+            returned ``new_anchor_pose``, or, for AR step 0, the true prefix
+            frame's raw pose (reproduces the fixed-trajectory/batch path
+            exactly) or a caller-chosen virtual origin such as
+            ``torch.eye(4)`` (live control, where no real prefix camera pose
+            exists).
+        image_height: Pixel-frame height.
+        image_width: Pixel-frame width.
+        len_t: Generated latent frames per AR/causal block -- must match the
+            transformer's own ``len_t``. Call boundaries must align with
+            block boundaries: unlike :func:`build_camera_conditioning`
+            (which derives block boundaries from the whole trajectory this
+            call's caller doesn't have), this function has no way to detect
+            a mismatch on its own, so it's enforced explicitly here instead
+            of silently producing wrong tokens for every frame from the next
+            AR step onward.
+        frame_stride: Pixel frames per latent-frame interval; must match
+            ``build_camera_conditioning``'s and equal the decoder's
+            temporal compression ratio.
+        patch_size: Spatial unshuffle factor aligned with the DiT token grid.
+        output_dtype: Output camera-token dtype.
+
+    Returns:
+        ``(tokens, new_anchor_pose)``: tokens shaped ``[..., len_t, 6 *
+        patch_size**2, H/patch_size, W/patch_size]``; ``new_anchor_pose``
+        shaped ``[..., 1, 4, 4]``, to pass as ``anchor_pose`` for the next
+        chunk.
+    """
+    if camera_to_world.shape[-2:] != (4, 4):
+        raise ValueError("camera_to_world must end in [T, 4, 4]")
+    if anchor_pose.shape[-3:] != (1, 4, 4):
+        raise ValueError("anchor_pose must have shape [..., 1, 4, 4]")
+    expected_new_frames = len_t * frame_stride
+    if camera_to_world.shape[-3] != expected_new_frames:
+        raise ValueError(
+            "camera_to_world must contain exactly len_t * frame_stride = "
+            f"{expected_new_frames} new pixel frames (one AR block); got "
+            f"{camera_to_world.shape[-3]}."
+        )
+
+    windowed = torch.cat(
+        [
+            anchor_pose.to(device=camera_to_world.device, dtype=camera_to_world.dtype),
+            camera_to_world,
+        ],
+        dim=-3,
+    )
+    frame_indices = camera_frame_indices(
+        windowed.shape[-3],
+        frame_stride,
+        device=windowed.device,
+    )
+    if frame_indices.numel() < 2:
+        raise ValueError(
+            "incremental_camera_conditioning requires at least one new latent frame"
+        )
+    sampled_poses = windowed.index_select(-3, frame_indices)
+    new_frame_indices = frame_indices[1:] - 1
+    sampled_intrinsics = _sample_intrinsics(
+        intrinsics.to(device=camera_to_world.device),
+        new_frame_indices,
+        camera_to_world.shape[-3],
+        camera_to_world.shape[:-3],
+    )
+    anchors = anchor_pose.expand_as(sampled_poses)
+    relative = torch.linalg.solve(anchors.float(), sampled_poses.float())[..., 1:, :, :]
+    rays = camera_rays(
+        relative,
+        sampled_intrinsics,
+        image_height=image_height,
+        image_width=image_width,
+    )
+    tokens = _rays_to_camera_tokens(
+        rays, patch_size=patch_size, output_dtype=output_dtype
+    )
+    new_anchor_pose = sampled_poses[..., -1:, :, :]
+    return tokens, new_anchor_pose

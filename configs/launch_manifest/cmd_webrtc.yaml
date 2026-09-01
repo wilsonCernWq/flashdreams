@@ -1,0 +1,13 @@
+schema_version: 1
+runner: cmd-chunk4-camera-i2v
+mode: webrtc
+
+output:
+  host: 0.0.0.0
+  port: 8080
+  fps: 16
+  video_width: 832
+  video_height: 480
+  warmup_chunks: 10
+  warmup_timeout_s: 600
+  client_liveness_timeout_s: 30
