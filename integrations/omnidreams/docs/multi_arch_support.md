@@ -433,6 +433,25 @@ whole "unknown error at block 0" mystery was self-inflicted by that one line.
 - These change *which kernels run*, not whether they run, so they need numerical validation on both
   a 5090/PRO 6000 and a GB10 before being trusted.
 
+> **⚠️ Phase 4's fallback recommendation below is WRONG — corrected 2026-09-01 after implementing
+> Phases 0-2 (see branch `dev/omnidreams-sm121-support`, commit `bcb5af9`).** Two things were verified
+> while attempting it:
+> 1. `run_cosmos_fp8_flash_tc*` is **dead code**. Nothing in the tree calls it (only self-references),
+>    so there is no wired path to "fall back to" — it needs new plumbing, including workspace buffers
+>    the FP8 runtime currently allocates as singletons.
+> 2. Despite the name it is **not flash attention** — it materializes the full score matrix
+>    (`score_total = B*H*Mq*Mk`, `cosmos_fp8_flash_tc.cu:288-294`) across `scores` +
+>    `score_c_scratch` (bf16) + `probs` (fp8). At the 8192-token shape that is 1.07e9 elements,
+>    **~5 GB of scratch**. Usable at short sequence lengths only; it cannot be a general fallback.
+>
+> Phase 4 is therefore a real project — workspace plumbing, a layout-conversion path, and a
+> length-dependent policy — not a fallback call. It was left unimplemented rather than half-built.
+>
+> Everything else in this doc held. In particular the arch diagnosis and the `generate_stats` root
+> cause were confirmed, and the prediction that fixing `generate_stats` alone makes the bf16 forward
+> pass end-to-end on GB10 is now **measured**: 1.99 ms/step at 256 tokens, 93.7 ms/step at 8192
+> tokens, where previously every backend x shape cell failed.
+
 **Phase 4 — make the cuDNN FP8 gap a graceful, loud degradation. (GB10-validatable.)**
 cuDNN 9.20 has no FP8 fused-MHA engine for sm_121 (§1.3b), and that is not fixable in this repo. The
 professional handling is three things, none of which is "support sm_120a only":
