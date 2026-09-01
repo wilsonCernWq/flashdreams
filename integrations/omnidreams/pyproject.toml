@@ -132,6 +132,8 @@ interactive-drive-configuration = "omnidreams.interactive_drive.input_config.app
 "omnidreams-experiment1-skip-finalize-kv-cache-noise250" = "omnidreams.config:RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE250"
 "omnidreams-experiment1-skip-finalize-kv-cache-noise150" = "omnidreams.config:RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE150"
 "omnidreams-experiment1-skip-finalize-kv-cache-noise100" = "omnidreams.config:RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE100"
+"omnidreams-native-dit-bf16" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_BF16"
+"omnidreams-native-dit-fp8" = "omnidreams.config:RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_FP8"
 
 [tool.setuptools.packages.find]
 include = ["omnidreams*"]
