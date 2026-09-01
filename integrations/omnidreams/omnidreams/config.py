@@ -609,6 +609,8 @@ OMNIDREAMS_RUNNERS: dict[str, RunnerConfig] = {
     for cfg in (
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE,
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_BF16,
+        RUNNER_SV_2STEPS_CHUNK2_NATIVE_DIT_FP8,
     )
 }
 """All shipped Omnidreams runners (single- and multi-view variants),
