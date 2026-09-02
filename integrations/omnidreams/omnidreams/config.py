@@ -569,7 +569,25 @@ OMNIDREAMS_RUNNERS: dict[str, RunnerConfig] = {
     for cfg in (
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE,
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_NATIVE_PERF,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_VAE_VAE,
+        RUNNER_SV_2STEPS_CHUNK3_LOC6_VAE_VAE,
+        RUNNER_SV_2STEPS_CHUNK4_LOC8_PSHUFFLE_LIGHTTAE,
+        RUNNER_MV_2STEPS_CHUNK4_LOC8_PSHUFFLE_LIGHTTAE,
+        RUNNER_SV_35STEPS_CHUNK2_LOC24_COSMOS2_2B_RES720P_30FPS_HDMAP_VAE_MADS1M,
+        RUNNER_SV_35STEPS_CHUNK48_LOC48_COSMOS2_2B_RES720P_30FPS_HDMAP_VAE_MADS1M,
+        RUNNER_EXPERIMENT1_BASELINE,
+        RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE,
+        RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE350,
+        RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE250,
+        RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE150,
+        RUNNER_EXPERIMENT1_SKIP_FINALIZE_KV_CACHE_NOISE100,
     )
 }
-"""All shipped Omnidreams runners (single- and multi-view variants),
-keyed by ``runner_name``."""
+"""Every Omnidreams runner, keyed by ``runner_name``.
+
+Must mirror the ``flashdreams.runner_configs`` entry points exactly --
+``test_recipe_configs.py`` asserts set equality against this dict both from
+``pyproject.toml`` and from the installed metadata. It is also the lookup
+table for ``test_quality_regression.py`` and ``demo/adapter.py``, so a slug
+missing here is unreachable there even when the CLI can see it."""
