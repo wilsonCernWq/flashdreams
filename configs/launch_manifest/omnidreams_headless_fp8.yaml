@@ -1,0 +1,30 @@
+# Headless local-window run for timing the native FP8 DiT.
+#
+# `omnidreams_local_window.yaml` assumes a desktop session: it waits for the
+# browser scene picker (`auto_start: false`) and never exits on its own. This
+# one auto-starts, serves frames over MJPEG instead of a Vulkan window, and
+# stops after a fixed number of chunks, so it can be timed on a remote box.
+#
+#   uv run flashdreams-run omnidreams-perf local-window \
+#     --manifest configs/launch_manifest/omnidreams_headless_fp8.yaml
+#
+# View it with: ssh -L 8080:localhost:8080 <host>, then open localhost:8080
+#
+# FP8 lives in the world model manifest, not here. `mp4` and `null` modes do
+# not read a world model manifest at all (launch.py:141-147), so only
+# local-window and webrtc can exercise the native DiT.
+schema_version: 1
+runner: omnidreams-perf
+mode: local-window
+
+scenario:
+  auto_start: true
+  preload_scenes: false
+
+output:
+  world_model_manifest_path: ../../integrations/omnidreams/omnidreams/interactive_drive/configs/example_world_model_perf.yaml
+  stream_mjpeg: ":8080"
+  no_hud: true
+  bev: false
+  profile_world_model: true
+  stop_after_chunks: 60
