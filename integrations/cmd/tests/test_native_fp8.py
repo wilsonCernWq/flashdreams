@@ -59,6 +59,21 @@ _OMNIDREAMS_KERNEL_DIR = (
 _EXPECTED_SM120_SITES = {"ops.cu": 40, "cosmos_fp8_tc_probe.cu": 8}
 
 
+def _kernel_code(path: Path) -> str:
+    """Source with comments removed, so prose cannot move the inventory.
+
+    Both arch inventories below count identifier occurrences. Without this,
+    a comment *explaining* the arch situation changes the counts: the
+    ``cutlass::arch::Sm120``-is-correct-for-sm_121 note at ``ops.cu:668-676``
+    mentions both ``Sm120`` and ``Sm121`` in prose, which inflated the Sm120
+    tally by one and made the Sm121 check report vendored SM121 kernels that
+    do not exist. These tests are about emitted device code, not documentation.
+    """
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
 def _uncameraed_config() -> CMDTransformerConfig:
     """A CMD config with camera conditioning off (native-eligible by model)."""
     return CMDTransformerConfig(network=CMDDiTNetworkConfig(camera_dim=None))
@@ -261,11 +276,11 @@ def test_sm120_kernel_sites_match_expected_inventory() -> None:
     need re-verifying — so drift fails here rather than at kernel launch.
     """
     pattern = re.compile(r"Sm120[A-Za-z0-9_]*")
-    actual = {
-        path.name: len(pattern.findall(path.read_text(encoding="utf-8")))
-        for path in sorted(_OMNIDREAMS_KERNEL_DIR.glob("*.cu"))
-        if pattern.search(path.read_text(encoding="utf-8"))
-    }
+    actual = {}
+    for path in sorted(_OMNIDREAMS_KERNEL_DIR.glob("*.cu")):
+        hits = pattern.findall(_kernel_code(path))
+        if hits:
+            actual[path.name] = len(hits)
     assert actual == _EXPECTED_SM120_SITES
 
 
@@ -282,6 +297,6 @@ def test_no_sm121_kernel_support_is_vendored() -> None:
     sm121_hits = [
         path.name
         for path in sorted(_OMNIDREAMS_KERNEL_DIR.glob("*.cu"))
-        if "Sm121" in path.read_text(encoding="utf-8")
+        if "Sm121" in _kernel_code(path)
     ]
     assert sm121_hits == []
