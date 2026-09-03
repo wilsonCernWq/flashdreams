@@ -172,15 +172,24 @@ cudaError_t cublaslt_strided_batched_bf16_gemm(
 // 2) Element-wise primitives (defined in `cosmos_modulate.cu`)
 // ---------------------------------------------------------------------------
 
-// Y = norm(X) * (1 + scale) + shift
+// Y = norm(X) * (1 + scale) + shift + cam
 //   X      [M, K]    activations (no-affine LayerNorm input)
 //   shift  [B, K]    per-row modulation shift; broadcast to (M / B) rows each
 //   scale  [B, K]    per-row modulation scale
+//   cam    [M, K]    optional additive term applied AFTER modulation (CMD
+//                    camera conditioning). nullptr = none. Indexed PER TOKEN,
+//                    exactly like X -- not per batch like shift/scale. Must
+//                    have X's row count and row-major layout, be contiguous,
+//                    and not alias X or Y.
+//
+// `cam` has no default: every call site must state its camera intent, so that
+// adding a new one cannot silently drop camera conditioning.
 template <typename ElementT>
 cudaError_t cosmos_layernorm_modulate(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     ElementT* Y,
     int M, int K,
     int B,
@@ -194,6 +203,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     ElementT* Y,
     cutlass::float_e4m3_t* Y_fp8,
     int M, int K,
@@ -208,6 +218,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8_only(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     cutlass::float_e4m3_t* Y_fp8,
     int M, int K,
     int B,
@@ -488,6 +499,17 @@ struct CosmosBlockParams {
   const cutlass::bfloat16_t* precomputed_mods_sa;  // [B, 3K] optional (shift, scale, gate)
   const cutlass::bfloat16_t* precomputed_mods_ca;  // [B, 3K] optional (shift, scale, gate)
   const cutlass::bfloat16_t* precomputed_mods_mlp; // [B, 3K] optional (shift, scale, gate)
+
+  // Optional CMD camera conditioning: cam_encoder(camera) for THIS block,
+  // already projected to model_channels by the Python side. Added after the
+  // self-attention LayerNorm + AdaLN modulation, matching
+  // CMDTransformerBlock.forward (flashdreams_cmd/transformer/modules.py:119-120).
+  //
+  // Layout matches `x` exactly: [B, M, K] row-major, contiguous, bf16 --
+  // PER TOKEN, unlike the [B, K] shift/scale vectors. nullptr = no camera.
+  // Only the self-attention modulation consumes this; cross-attn and MLP take
+  // no camera term.
+  const cutlass::bfloat16_t* cam_sa;
 
   // Cross-attn pre-cached K/V (post k_norm, no RoPE; these are written by
   // FlashDreams' CrossAttention.initialize_cache and stay constant for the

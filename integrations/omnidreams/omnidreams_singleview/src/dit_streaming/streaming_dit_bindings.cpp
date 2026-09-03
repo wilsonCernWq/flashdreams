@@ -65,6 +65,10 @@ void bind_optimized_dit(py::module_& module) {
     return false;
 #endif
   }, py::arg("device") = -1);
+  module.def("cosmos_test_layernorm_modulate", &::cosmos_test_layernorm_modulate,
+      py::arg("x"), py::arg("shift"), py::arg("scale"),
+      py::arg("cam") = py::none(), py::arg("B") = 1,
+      py::arg("variant") = "plain");
   module.def("optimized_dit_supports_block_mod_cache", []() { return true; });
   module.def("optimized_dit_supports_hdmap_cache", []() { return true; });
 }

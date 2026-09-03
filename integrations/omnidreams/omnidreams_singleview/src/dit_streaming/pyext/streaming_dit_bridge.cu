@@ -272,6 +272,95 @@ static torch::Tensor get_w(const py::dict& d, const std::string& key) {
     return py::cast<torch::Tensor>(d[key.c_str()]).contiguous();
 }
 
+// Test/bring-up hook: drive one of the three LayerNorm+modulate launchers on
+// plain tensors, so their numerics can be checked against a PyTorch reference
+// without running a whole block forward.
+//
+// These kernels are arch-neutral (no cutlass::arch::Sm120 anywhere in
+// cosmos_modulate.cu), so unlike the FP8 GEMM path this is runnable on any
+// Blackwell part, including sm_121 where cuDNN has no FP8 fused MHA.
+//
+// `variant` selects which launcher runs: "plain" writes only bf16, "to_fp8"
+// writes both, "to_fp8_only" writes only the raw E4M3 bytes. The returned dict
+// carries just the outputs that variant produced ("y" and/or "y_fp8").
+py::dict cosmos_test_layernorm_modulate(
+    torch::Tensor x,
+    torch::Tensor shift,
+    torch::Tensor scale,
+    c10::optional<torch::Tensor> cam_opt,
+    int64_t B,
+    const std::string& variant)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be torch.bfloat16");
+    TORCH_CHECK(x.dim() == 2, "x must be [M, K]");
+    TORCH_CHECK(B > 0, "B must be positive");
+
+    x = x.contiguous();
+    const int M = static_cast<int>(x.size(0));
+    const int K = static_cast<int>(x.size(1));
+    TORCH_CHECK(M % B == 0, "M=", M, " must be divisible by B=", B);
+
+    auto check_mod = [&](torch::Tensor t, const char* name) {
+        TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be torch.bfloat16");
+        TORCH_CHECK(t.dim() == 2 && t.size(0) == B && t.size(1) == K,
+                    name, " must be [", B, ", ", K, "]");
+        return t.contiguous();
+    };
+    shift = check_mod(shift, "shift");
+    scale = check_mod(scale, "scale");
+
+    // cam is per-TOKEN — it must have x's row count, not shift/scale's. Getting
+    // this wrong is silent at B==1, so the shape is checked rather than assumed.
+    torch::Tensor cam;
+    const cutlass::bfloat16_t* cam_ptr = nullptr;
+    if (cam_opt.has_value() && cam_opt.value().defined()) {
+        cam = cam_opt.value().contiguous();
+        TORCH_CHECK(cam.is_cuda(), "cam must be CUDA");
+        TORCH_CHECK(cam.scalar_type() == at::kBFloat16, "cam must be torch.bfloat16");
+        TORCH_CHECK(cam.dim() == 2 && cam.size(0) == M && cam.size(1) == K,
+                    "cam must be [", M, ", ", K, "] (per token, like x), got [",
+                    cam.size(0), ", ", cam.dim() > 1 ? cam.size(1) : 0, "]");
+        cam_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(cam.data_ptr<at::BFloat16>());
+    }
+
+    const bool want_bf16 = (variant == "plain" || variant == "to_fp8");
+    const bool want_fp8 = (variant == "to_fp8" || variant == "to_fp8_only");
+    TORCH_CHECK(want_bf16 || want_fp8,
+                "variant must be one of plain|to_fp8|to_fp8_only, got '", variant, "'");
+
+    auto y = torch::empty({M, K}, x.options());
+    auto y_fp8 = torch::empty({M, K},
+                              torch::TensorOptions().dtype(torch::kUInt8).device(x.device()));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    const auto* x_p = reinterpret_cast<const cutlass::bfloat16_t*>(x.data_ptr<at::BFloat16>());
+    const auto* sh_p = reinterpret_cast<const cutlass::bfloat16_t*>(shift.data_ptr<at::BFloat16>());
+    const auto* sc_p = reinterpret_cast<const cutlass::bfloat16_t*>(scale.data_ptr<at::BFloat16>());
+    auto* y_p = reinterpret_cast<cutlass::bfloat16_t*>(y.data_ptr<at::BFloat16>());
+    auto* y8_p = reinterpret_cast<cutlass::float_e4m3_t*>(y_fp8.data_ptr<uint8_t>());
+
+    cudaError_t err = cudaSuccess;
+    if (variant == "plain") {
+        err = omnidreams_singleview::cosmos_layernorm_modulate<cutlass::bfloat16_t>(
+            x_p, sh_p, sc_p, cam_ptr, y_p, M, K, static_cast<int>(B), 1e-6f, stream);
+    } else if (variant == "to_fp8") {
+        err = omnidreams_singleview::cosmos_layernorm_modulate_to_fp8<cutlass::bfloat16_t>(
+            x_p, sh_p, sc_p, cam_ptr, y_p, y8_p, M, K, static_cast<int>(B), 1e-6f, stream);
+    } else {
+        err = omnidreams_singleview::cosmos_layernorm_modulate_to_fp8_only<cutlass::bfloat16_t>(
+            x_p, sh_p, sc_p, cam_ptr, y8_p, M, K, static_cast<int>(B), 1e-6f, stream);
+    }
+    TORCH_CHECK(err == cudaSuccess,
+                "cosmos_test_layernorm_modulate(", variant, ") failed: ", cudaGetErrorString(err));
+
+    py::dict out;
+    if (want_bf16) out["y"] = y;
+    if (want_fp8) out["y_fp8"] = y_fp8;
+    return out;
+}
+
 torch::Tensor cosmos_test_linear_fp8(
     torch::Tensor input,
     torch::Tensor weight_fp8_u8,
@@ -3064,10 +3153,13 @@ torch::Tensor optimized_dit_forward(
         shift_2d = shift_2d.contiguous();
         scale_2d = scale_2d.contiguous();
         auto final_normed = torch::empty({B, L, K}, opts);
+        // /*cam=*/nullptr: this is the network's final layer, not a block
+        // sublayer; camera conditioning applies only inside the blocks.
         cudaError_t final_ln_err = omnidreams_singleview::cosmos_layernorm_modulate<cutlass::bfloat16_t>(
             reinterpret_cast<const cutlass::bfloat16_t*>(cur.data_ptr<at::BFloat16>()),
             reinterpret_cast<const cutlass::bfloat16_t*>(shift_2d.data_ptr<at::BFloat16>()),
             reinterpret_cast<const cutlass::bfloat16_t*>(scale_2d.data_ptr<at::BFloat16>()),
+            /*cam=*/nullptr,
             reinterpret_cast<cutlass::bfloat16_t*>(final_normed.data_ptr<at::BFloat16>()),
             B * L, K, B, 1e-6f, stream);
         TORCH_CHECK(final_ln_err == cudaSuccess, "final layernorm_modulate failed: ", cudaGetErrorString(final_ln_err));

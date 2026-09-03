@@ -941,8 +941,13 @@ static cudaError_t cosmos_linear_prequantized_fp8_residual_layernorm_modulate_to
       p, input_fp8, weight, weight_scale, residual_inout, gate,
       N, in_features, out_features, stream, input_scale);
   if (err != cudaSuccess) return err;
+  // /*cam=*/nullptr: this helper is reached only from the SA-out (:2659, CA LN)
+  // and CA-out (:2808, MLP LN) fused call sites, so `ln_shift`/`ln_scale` are
+  // always cross-attention or MLP modulation -- never self-attention. Camera
+  // belongs to the SA modulation alone. If that invariant ever changes, the
+  // fused epilogue in cosmos_modulate.cu needs a camera term too.
   return cosmos_layernorm_modulate_to_fp8_only<cutlass::bfloat16_t>(
-      residual_inout, ln_shift, ln_scale, fp8_out,
+      residual_inout, ln_shift, ln_scale, /*cam=*/nullptr, fp8_out,
       N, out_features, B, eps, stream);
 }
 
@@ -2397,15 +2402,19 @@ cudaError_t cosmos_run_transformer_block_streaming(
       sa_qkv_fp8 && p.w.sa_w_qkv && p.w.sa_w_qkv_scale && p.buf.qkv_row;
   const bool sa_normed_fp8_only =
       use_fused_fp8_qkv || (sa_q_fp8 && sa_k_fp8 && sa_v_fp8);
+  // p.cam_sa is the ONLY site that carries a camera term: CMD injects it after
+  // the self-attention LayerNorm + AdaLN modulation and nowhere else. All three
+  // branches must pass it -- which one runs depends on the linear backend, so
+  // updating only some would be a config-dependent silent drop.
   if (sa_normed_needs_fp8) {
     err = sa_normed_fp8_only
         ? cosmos_layernorm_modulate_to_fp8_only<bf16>(
-            p.x, shift_sa, scale_sa, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream)
+            p.x, shift_sa, scale_sa, p.cam_sa, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream)
         : cosmos_layernorm_modulate_to_fp8<bf16>(
-            p.x, shift_sa, scale_sa, normed, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
+            p.x, shift_sa, scale_sa, p.cam_sa, normed, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
   } else {
     err = cosmos_layernorm_modulate<bf16>(
-        p.x, shift_sa, scale_sa, normed, M * B, K, B, 1e-6f, stream);
+        p.x, shift_sa, scale_sa, p.cam_sa, normed, M * B, K, B, 1e-6f, stream);
   }
   if (err != cudaSuccess) return err;
   rec(EV_AFTER_SA_LN);
@@ -2692,11 +2701,12 @@ cudaError_t cosmos_run_transformer_block_streaming(
     // CA LN/modulate -> FP8 was fused into the SA-out residual kernel above.
     err = cudaSuccess;
   } else if (ca_normed_needs_fp8) {
+    // /*cam=*/nullptr: cross-attention takes no camera term.
     err = cosmos_layernorm_modulate_to_fp8_only<bf16>(
-        p.x, shift_ca, scale_ca, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
+        p.x, shift_ca, scale_ca, /*cam=*/nullptr, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
   } else {
     err = cosmos_layernorm_modulate<bf16>(
-        p.x, shift_ca, scale_ca, normed, M * B, K, B, 1e-6f, stream);
+        p.x, shift_ca, scale_ca, /*cam=*/nullptr, normed, M * B, K, B, 1e-6f, stream);
   }
   if (err != cudaSuccess) return err;
 
@@ -2840,11 +2850,12 @@ cudaError_t cosmos_run_transformer_block_streaming(
     // MLP LN/modulate -> FP8 was fused into the CA-out residual kernel above.
     err = cudaSuccess;
   } else if (ffn_normed_needs_fp8) {
+    // /*cam=*/nullptr: the MLP takes no camera term.
     err = cosmos_layernorm_modulate_to_fp8_only<bf16>(
-        p.x, shift_ml, scale_ml, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
+        p.x, shift_ml, scale_ml, /*cam=*/nullptr, p.buf.linear_fp8_scratch, M * B, K, B, 1e-6f, stream);
   } else {
     err = cosmos_layernorm_modulate<bf16>(
-        p.x, shift_ml, scale_ml, normed, M * B, K, B, 1e-6f, stream);
+        p.x, shift_ml, scale_ml, /*cam=*/nullptr, normed, M * B, K, B, 1e-6f, stream);
   }
   if (err != cudaSuccess) return err;
   rec(EV_AFTER_MLP_LN);
