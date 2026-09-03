@@ -2583,6 +2583,52 @@ torch::Tensor optimized_dit_forward(
         block_mod_cache_enabled = true;
     }
 
+    // Optional per-block camera conditioning (CMD). The projection
+    // cam_encoder(camera) is x-independent, so Python computes all num_blocks
+    // of them once per AR chunk and hands us one contiguous buffer; we only
+    // slice a pointer per block. See CMDTransformerBlock.forward.
+    //
+    // The buffer must be allocated once and refreshed in place, never
+    // reallocated within a rollout: this value reaches us through the config
+    // dict, which CUDAGraphWrapper does not stage, so its address is captured
+    // into the graph and a fresh tensor per chunk would leave the graph reading
+    // the previous one -- silently, since the allocator usually hands the same
+    // block back.
+    torch::Tensor cam_embed;
+    bool camera_enabled = false;
+    if (config.contains("cosmos_cam_embed")) {
+        cam_embed = py::cast<torch::Tensor>(config["cosmos_cam_embed"]);
+        TORCH_CHECK(cam_embed.is_cuda(), "config['cosmos_cam_embed'] must be a CUDA tensor");
+        TORCH_CHECK(cam_embed.device() == x_new.device(),
+                    "config['cosmos_cam_embed'] must be on device ", x_new.device());
+        TORCH_CHECK(cam_embed.scalar_type() == orig_scalar_type,
+                    "config['cosmos_cam_embed'] has dtype ", cam_embed.scalar_type(),
+                    ", expected ", orig_scalar_type);
+        TORCH_CHECK(cam_embed.dim() == 4 &&
+                    (int)cam_embed.size(0) == num_blocks &&
+                    (int)cam_embed.size(1) == B &&
+                    (int)cam_embed.size(2) == M &&
+                    (int)cam_embed.size(3) == K,
+                    "config['cosmos_cam_embed'] must have shape [", num_blocks, ", ", B,
+                    ", ", M, ", ", K, "], got [",
+                    cam_embed.dim() > 0 ? cam_embed.size(0) : 0, ", ",
+                    cam_embed.dim() > 1 ? cam_embed.size(1) : 0, ", ",
+                    cam_embed.dim() > 2 ? cam_embed.size(2) : 0, ", ",
+                    cam_embed.dim() > 3 ? cam_embed.size(3) : 0, "]");
+        TORCH_CHECK(cam_embed.is_contiguous(), "config['cosmos_cam_embed'] must be contiguous");
+        camera_enabled = true;
+    }
+
+    // A camera-conditioned checkpoint that reaches here without cosmos_cam_embed
+    // would render camera-blind video rather than fail, because get_w only looks
+    // up the keys it knows and ignores the rest. Refuse instead. One dict lookup
+    // per forward buys the difference between a wrong video and a crash.
+    TORCH_CHECK(camera_enabled ||
+                !weights.contains(py::str(block_prefix(0) + "self_attn.cam_encoder.weight")),
+                "weights contain blocks.0.self_attn.cam_encoder.weight but "
+                "config['cosmos_cam_embed'] is absent; the forward would silently drop "
+                "camera conditioning. Supply cosmos_cam_embed, or pack a camera-free model.");
+
     auto validate_fp8_activation_tensor_shape = [&](const torch::Tensor& tensor, const char* name) {
         TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must be torch.float32; got ", tensor.scalar_type());
         TORCH_CHECK(tensor.dim() == 2 &&
@@ -2993,6 +3039,14 @@ torch::Tensor optimized_dit_forward(
                 block_mods_ca.data_ptr<at::BFloat16>()) + static_cast<int64_t>(i) * block_mod_stride;
             bp.precomputed_mods_mlp = reinterpret_cast<const cutlass::bfloat16_t*>(
                 block_mods_mlp.data_ptr<at::BFloat16>()) + static_cast<int64_t>(i) * block_mod_stride;
+        }
+        if (camera_enabled) {
+            // [num_blocks, B, M, K] -> the [B, M, K] slab for this block. No
+            // else-branch needed: bp is value-initialized, so cam_sa is already
+            // nullptr when there is no camera.
+            const int64_t cam_stride = static_cast<int64_t>(B) * M * K;
+            bp.cam_sa = reinterpret_cast<const cutlass::bfloat16_t*>(
+                cam_embed.data_ptr<at::BFloat16>()) + static_cast<int64_t>(i) * cam_stride;
         }
         bp.k_cross = reinterpret_cast<const cutlass::bfloat16_t*>(k_cross_caches[i].data_ptr<at::BFloat16>());
         bp.v_cross = reinterpret_cast<const cutlass::bfloat16_t*>(v_cross_caches[i].data_ptr<at::BFloat16>());
