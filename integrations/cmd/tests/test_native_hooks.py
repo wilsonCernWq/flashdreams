@@ -52,7 +52,10 @@ class _StubExecutor:
 
     def predict_flow(self, **kwargs: Any) -> torch.Tensor:
         self.predict_calls.append(kwargs)
-        return torch.zeros(1)
+        # The real executor returns the bridge layout [B, V, T, HW, D]; the hook
+        # translates it back. Echoing the shape it was handed keeps that round
+        # trip exercised instead of stubbed past.
+        return torch.zeros_like(kwargs["noisy_latent"])
 
     def after_initialize_autoregressive_cache(self, cache: Any) -> None:
         self.after_init_calls += 1
@@ -73,27 +76,44 @@ def _transformer_with(executor: Any, *, camera_dim: int | None = None) -> CMDTra
     transformer.config = config.diffusion_model.transformer
     transformer._optimized_dit_executor = executor
     transformer._optimized_dit_selection = None
+    # Normally resolved in initialize_autoregressive_cache from the rollout's
+    # height/width. Must multiply out to the L of the latents these tests pass
+    # ([4, 8], so L=4) -- to_bridge_latent checks that rather than reshaping
+    # blindly, which is the point of it.
+    transformer._native_grid = (2, 2)
     return transformer
 
 
 def test_config_satisfies_the_executor_contract() -> None:
     """Every field OptimizedDiTExecutor reads must resolve on a CMD config.
 
-    The executor touches exactly these nine. Six CMD already had; three
-    (num_heads, patch_spatial, patch_temporal) sit on ``network`` here but at the
-    top level in omnidreams' config, so CMD forwards them. A missing one does
-    not fail politely -- it surfaces as a wrong token grid inside a kernel, or an
-    AttributeError several frames into a rollout.
+    Four are forwarded by CMD (num_views, num_heads, patch_spatial,
+    patch_temporal); the rest it already had. A missing one does not fail
+    politely -- it is an AttributeError several frames into setup, or worse, a
+    wrong token grid handed to a kernel.
 
-    Derived from ``grep 'self\\.config\\.' optimized_dit.py``; if the executor
-    grows a new field this test is what catches it, at import time on CPU.
+    **On how this list was derived, and how it was wrong.** The first version
+    came from ``grep 'self\\.config\\.'`` and found nine fields. It missed
+    ``num_views``, which the executor reads through a local alias as
+    ``config.num_views`` -- and the first real run failed on exactly that. The
+    pattern below covers both spellings and finds twelve:
+
+        grep -oP '(self\\.config|(?<![.\\w])config)\\.\\K[a-z_]+(\\.[a-z_]+)?' \\
+            omnidreams_singleview/python/optimized_dit.py
+
+    Still not proof: a field reached via ``getattr``, or through a config object
+    passed under another name, would evade both. This test pins what is known,
+    and the honest backstop remains actually running the thing.
     """
     for name in CMD_CONFIGS:
         config = CMD_CONFIGS[name].diffusion_model.transformer
         assert config.dtype is not None
         assert int(config.num_heads) > 0
+        assert int(config.num_views) == 1, "the native path is single-view only"
         assert int(config.patch_spatial) > 0
         assert int(config.patch_temporal) > 0
+        assert config.use_cuda_graph is not None
+        assert int(config.cuda_graph_warmup_iters) >= 0
         assert int(config.network.adaln_lora_dim) > 0
         assert int(config.network.model_channels) > 0
         assert int(config.network.num_blocks) > 0
@@ -161,6 +181,31 @@ def test_camera_is_not_forwarded_as_hdmap() -> None:
     assert forwarded.numel() == 0, (
         "a non-empty tensor reached the executor's HDMap slot"
     )
+
+
+def test_latent_layout_round_trips() -> None:
+    """CMD's ``[..., L, D]`` goes down as ``[B, V, T, HW, D]`` and comes back.
+
+    The executor speaks the bridge's five-dimensional layout; CMD's pipeline
+    speaks a flat token sequence. Both directions happen inside ``predict_flow``,
+    so a mistake in either would surface as a shape error deep in the caller
+    rather than here.
+    """
+    executor = _StubExecutor()
+    transformer = _transformer_with(executor)
+    latent = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
+
+    out = transformer.predict_flow(
+        noisy_latent=latent, timestep=torch.zeros(()), cache=object(), input=None
+    )
+    assert out.shape == latent.shape, "the flow did not come back in CMD's layout"
+
+    sent = executor.predict_calls[0]["noisy_latent"]
+    assert sent.dim() == 5, "the executor was not handed the bridge layout"
+    assert sent.shape == (1, 1, 2, 2, 8), sent.shape
+    # Same storage, reinterpreted -- a copy here would be silent waste at
+    # 28 blocks x every scheduler step.
+    assert sent.data_ptr() == latent.data_ptr()
 
 
 def test_a_camera_tensor_on_a_camera_free_model_is_refused() -> None:

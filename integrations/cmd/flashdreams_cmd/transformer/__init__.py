@@ -112,6 +112,16 @@ class CMDTransformerConfig(CosmosTransformerConfig):
     # wrong token grid deep inside a kernel.
 
     @property
+    def num_views(self) -> int:
+        """CMD is single-view; omnidreams' config carries this for multi-camera.
+
+        The executor reads it only to refuse ``> 1`` -- ``optimized_dit_forward``
+        has no cross-view attention. Returning the constant states that plainly
+        rather than leaving an AttributeError several frames into setup.
+        """
+        return 1
+
+    @property
     def num_heads(self) -> int:
         return int(self.network.num_heads)
 
@@ -147,6 +157,10 @@ class CMDTransformer(CosmosTransformer):
 
         self._optimized_dit_executor: Any | None = None
         self._optimized_dit_selection: Any | None = None
+        # (temporal_positions, spatial_positions) for the current rollout;
+        # resolved in initialize_autoregressive_cache, where height/width are
+        # first known.
+        self._native_grid: tuple[int, int] | None = None
         if native_enabled:
             self._configure_optimized_dit_from_config()
 
@@ -240,11 +254,47 @@ class CMDTransformer(CosmosTransformer):
                 "a camera tensor was supplied to a CMD model with "
                 "camera_dim=None; the native path has nowhere to put it"
             )
-        return executor.predict_flow(
-            noisy_latent=noisy_latent,
+        grid = self._native_grid
+        if grid is None:
+            raise RuntimeError(
+                "predict_flow reached the native path before "
+                "initialize_autoregressive_cache resolved the latent grid"
+            )
+        temporal_positions, spatial_positions = grid
+        bridge_latent = native_adapter.to_bridge_latent(
+            noisy_latent,
+            temporal_positions=temporal_positions,
+            spatial_positions=spatial_positions,
+        )
+        flow = executor.predict_flow(
+            noisy_latent=bridge_latent,
             timestep=timestep,
             cache=cache,
-            input=native_adapter.empty_hdmap_like(noisy_latent),
+            input=native_adapter.empty_hdmap_like(bridge_latent),
+        )
+        return native_adapter.from_bridge_latent(
+            flow, batch_shape=tuple(noisy_latent.shape[:-2])
+        )
+
+    def _select_mask(self, cache: CosmosTransformerCache) -> Tensor:
+        """The mask follows the latent's layout, so it needs the same translation.
+
+        The executor calls back into this method
+        (``optimized_dit.py:832-833``) and forwards the result straight to
+        ``condition_mask_patched``, which the bridge validates as 5D. omnidreams'
+        cache already holds that shape; CMD's holds ``[..., L, D]``. Translating
+        here rather than at the call site keeps the eager path untouched --
+        ``_predict_flow`` concatenates the mask onto the latent and wants CMD's
+        own layout.
+        """
+        mask = super()._select_mask(cache)
+        if self._optimized_dit_executor is None or self._native_grid is None:
+            return mask
+        temporal_positions, spatial_positions = self._native_grid
+        return native_adapter.to_bridge_latent(
+            mask,
+            temporal_positions=temporal_positions,
+            spatial_positions=spatial_positions,
         )
 
     def finalize_kv_cache(self, *args: Any, **kwargs: Any) -> None:
@@ -376,6 +426,13 @@ class CMDTransformer(CosmosTransformer):
                 camera=camera_prefix,
             )
         if self._optimized_dit_executor is not None:
+            # The bridge wants [B, V, T, HW, D]; CMD carries [..., L, D]. The
+            # split of L into (T, HW) depends on the rollout's height/width,
+            # which is only known here, so it is resolved once and kept for
+            # predict_flow rather than re-derived per scheduler step.
+            self._native_grid = native_adapter.latent_grid(
+                self.config, height=height, width=width
+            )
             # Must run after prefill: the executor snapshots the cache templates
             # here, and it resets the CUDA graph in the same call, so anything
             # allocated per rollout is released in lockstep with the graph.
