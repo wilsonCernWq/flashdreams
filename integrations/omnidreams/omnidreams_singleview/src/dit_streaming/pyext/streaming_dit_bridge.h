@@ -109,6 +109,23 @@ torch::Tensor optimized_dit_forward(
     py::dict config
 );
 
+// Test/bring-up hook for the LayerNorm + AdaLN-modulate kernels:
+//   x     [M, K] bf16   activations
+//   shift [B, K] bf16   per-batch modulation shift, broadcast to M/B rows
+//   scale [B, K] bf16   per-batch modulation scale
+//   cam   [M, K] bf16   optional per-TOKEN camera term added after modulation
+//   variant            "plain" | "to_fp8" | "to_fp8_only"
+// Returns a dict with "y" (bf16) and/or "y_fp8" (raw E4M3 bytes as uint8),
+// whichever the selected variant produces.
+py::dict cosmos_test_layernorm_modulate(
+    torch::Tensor x,
+    torch::Tensor shift,
+    torch::Tensor scale,
+    c10::optional<torch::Tensor> cam,
+    int64_t B,
+    const std::string& variant
+);
+
 // Test/bring-up hook for the Cosmos FP8 RCR linear contract:
 //   input [N, in] fp16
 //   weight_fp8_u8 [out, in] raw E4M3 bytes in PyTorch Linear layout
