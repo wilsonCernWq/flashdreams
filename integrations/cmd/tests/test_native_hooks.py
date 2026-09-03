@@ -76,6 +76,43 @@ def _transformer_with(executor: Any, *, camera_dim: int | None = None) -> CMDTra
     return transformer
 
 
+def test_config_satisfies_the_executor_contract() -> None:
+    """Every field OptimizedDiTExecutor reads must resolve on a CMD config.
+
+    The executor touches exactly these nine. Six CMD already had; three
+    (num_heads, patch_spatial, patch_temporal) sit on ``network`` here but at the
+    top level in omnidreams' config, so CMD forwards them. A missing one does
+    not fail politely -- it surfaces as a wrong token grid inside a kernel, or an
+    AttributeError several frames into a rollout.
+
+    Derived from ``grep 'self\\.config\\.' optimized_dit.py``; if the executor
+    grows a new field this test is what catches it, at import time on CPU.
+    """
+    for name in CMD_CONFIGS:
+        config = CMD_CONFIGS[name].diffusion_model.transformer
+        assert config.dtype is not None
+        assert int(config.num_heads) > 0
+        assert int(config.patch_spatial) > 0
+        assert int(config.patch_temporal) > 0
+        assert int(config.network.adaln_lora_dim) > 0
+        assert int(config.network.model_channels) > 0
+        assert int(config.network.num_blocks) > 0
+        assert int(config.network.num_heads) > 0
+
+
+def test_forwarded_fields_track_network_patch_size() -> None:
+    """The three forwards must derive from ``network``, not shadow it.
+
+    A second stored copy could drift from ``patch_size``; these are properties
+    precisely so they cannot.
+    """
+    config = CMD_CONFIGS["cmd-chunk1-short-i2v"].diffusion_model.transformer
+    patch_t, patch_h, patch_w = config.network.patch_size
+    assert (config.patch_temporal, config.patch_spatial) == (patch_t, patch_h)
+    assert patch_h == patch_w, "the native path assumes square spatial patches"
+    assert config.num_heads == config.network.num_heads
+
+
 def test_config_defaults_leave_the_native_path_off() -> None:
     """Adding the fields must not change any shipped preset's behaviour."""
     for name in CMD_CONFIGS:

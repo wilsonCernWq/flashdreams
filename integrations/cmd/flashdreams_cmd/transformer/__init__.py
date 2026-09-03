@@ -103,6 +103,26 @@ class CMDTransformerConfig(CosmosTransformerConfig):
     native_dit_verbose_build: bool = False
     """Echo nvcc lines, for diagnosing a build that fails to load."""
 
+    ## Executor contract
+    #
+    # OptimizedDiTExecutor reads exactly nine config fields. Six CMD already
+    # has; these three live on `network` here but at the top level in
+    # omnidreams' config, so they are forwarded rather than duplicated -- a
+    # second copy could drift from `network.patch_size` and would surface as a
+    # wrong token grid deep inside a kernel.
+
+    @property
+    def num_heads(self) -> int:
+        return int(self.network.num_heads)
+
+    @property
+    def patch_temporal(self) -> int:
+        return native_adapter.resolve_patch_dims(self.network)[0]
+
+    @property
+    def patch_spatial(self) -> int:
+        return native_adapter.resolve_patch_dims(self.network)[1]
+
 
 class CMDTransformer(CosmosTransformer):
     """Run CMD generation after seeding the clean first-frame prefix."""
@@ -111,7 +131,7 @@ class CMDTransformer(CosmosTransformer):
     network: CMDDiTNetwork
 
     def __init__(self, config: CMDTransformerConfig) -> None:
-        native_enabled = getattr(config, "native_dit_acceleration", "disabled") != "disabled"
+        native_enabled = config.native_dit_acceleration != "disabled"
         if native_enabled and config.compile_network:
             # The base __init__ wraps self.network in compile_module before we
             # get a chance to build the executor, and the executor snapshots the
