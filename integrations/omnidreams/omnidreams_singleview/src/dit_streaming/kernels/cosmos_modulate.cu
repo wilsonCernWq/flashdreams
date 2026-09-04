@@ -95,6 +95,7 @@ __global__ void cosmos_layernorm_modulate_kernel(
     const ElementT* __restrict__ X,
     const ElementT* __restrict__ shift,    // [B, K] or [K]
     const ElementT* __restrict__ scale,    // [B, K] or [K]
+    const ElementT* __restrict__ cam,      // [M, K] per-token, or nullptr
     ElementT* __restrict__ Y,
     int M, int K, float eps,
     int shift_row_stride,                  // 0 = broadcast, K = per-row
@@ -145,11 +146,13 @@ __global__ void cosmos_layernorm_modulate_kernel(
 
   // Pass 2: normalize + modulate.
   for (int j = tid; j < K; j += blockDim.x) {
-    float v = (omnidreams_singleview::to_float(X[size_t(row) * K + j]) - mean) * inv;
+    size_t idx = size_t(row) * K + j;
+    float v = (omnidreams_singleview::to_float(X[idx]) - mean) * inv;
     float sh = omnidreams_singleview::to_float(shift[size_t(b_row) * shift_row_stride + j]);
     float sc = omnidreams_singleview::to_float(scale[size_t(b_row) * scale_row_stride + j]);
     v = v * (1.f + sc) + sh;
-    Y[size_t(row) * K + j] = omnidreams_singleview::from_float<ElementT>(v);
+    if (cam) v += omnidreams_singleview::to_float(cam[idx]);  // per-token: idx, not b_row
+    Y[idx] = omnidreams_singleview::from_float<ElementT>(v);
   }
 }
 
@@ -158,6 +161,7 @@ __global__ void cosmos_layernorm_modulate_to_fp8_kernel(
     const ElementT* __restrict__ X,
     const ElementT* __restrict__ shift,
     const ElementT* __restrict__ scale,
+    const ElementT* __restrict__ cam,      // [M, K] per-token, or nullptr
     ElementT* __restrict__ Y,
     cutlass::float_e4m3_t* __restrict__ Y_fp8,
     int M, int K, float eps,
@@ -210,6 +214,7 @@ __global__ void cosmos_layernorm_modulate_to_fp8_kernel(
     float sh = omnidreams_singleview::to_float(shift[size_t(b_row) * shift_row_stride + j]);
     float sc = omnidreams_singleview::to_float(scale[size_t(b_row) * scale_row_stride + j]);
     v = v * (1.f + sc) + sh;
+    if (cam) v += omnidreams_singleview::to_float(cam[idx]);  // per-token: idx, not b_row
     Y[idx] = omnidreams_singleview::from_float<ElementT>(v);
     Y_fp8[idx] = to_fp8(v);
   }
@@ -220,6 +225,7 @@ __global__ void cosmos_layernorm_modulate_to_fp8_only_kernel(
     const ElementT* __restrict__ X,
     const ElementT* __restrict__ shift,
     const ElementT* __restrict__ scale,
+    const ElementT* __restrict__ cam,      // [M, K] per-token, or nullptr
     cutlass::float_e4m3_t* __restrict__ Y_fp8,
     int M, int K, float eps,
     int shift_row_stride,
@@ -271,6 +277,7 @@ __global__ void cosmos_layernorm_modulate_to_fp8_only_kernel(
     float sh = omnidreams_singleview::to_float(shift[size_t(b_row) * shift_row_stride + j]);
     float sc = omnidreams_singleview::to_float(scale[size_t(b_row) * scale_row_stride + j]);
     v = v * (1.f + sc) + sh;
+    if (cam) v += omnidreams_singleview::to_float(cam[idx]);  // per-token: idx, not b_row
     Y_fp8[idx] = to_fp8(v);
   }
 }
@@ -281,6 +288,7 @@ cudaError_t cosmos_layernorm_modulate(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     ElementT* Y,
     int M, int K,
     int B,
@@ -303,7 +311,7 @@ cudaError_t cosmos_layernorm_modulate(
   int threads = 256;
   size_t smem = 2 * ((threads + 31) / 32) * sizeof(float);
   cosmos_layernorm_modulate_kernel<ElementT><<<M, threads, smem, stream>>>(
-      X, shift, scale, Y, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
+      X, shift, scale, cam, Y, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
   return cudaGetLastError();
 }
 
@@ -312,6 +320,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     ElementT* Y,
     cutlass::float_e4m3_t* Y_fp8,
     int M, int K,
@@ -332,7 +341,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8(
   int threads = 256;
   size_t smem = 2 * ((threads + 31) / 32) * sizeof(float);
   cosmos_layernorm_modulate_to_fp8_kernel<ElementT><<<M, threads, smem, stream>>>(
-      X, shift, scale, Y, Y_fp8, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
+      X, shift, scale, cam, Y, Y_fp8, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
   return cudaGetLastError();
 }
 
@@ -341,6 +350,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8_only(
     const ElementT* X,
     const ElementT* shift,
     const ElementT* scale,
+    const ElementT* cam,
     cutlass::float_e4m3_t* Y_fp8,
     int M, int K,
     int B,
@@ -360,7 +370,7 @@ cudaError_t cosmos_layernorm_modulate_to_fp8_only(
   int threads = 256;
   size_t smem = 2 * ((threads + 31) / 32) * sizeof(float);
   cosmos_layernorm_modulate_to_fp8_only_kernel<ElementT><<<M, threads, smem, stream>>>(
-      X, shift, scale, Y_fp8, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
+      X, shift, scale, cam, Y_fp8, M, K, eps, shift_row_stride, scale_row_stride, rows_per_b);
   return cudaGetLastError();
 }
 
@@ -821,23 +831,29 @@ cudaError_t cosmos_rmsnorm_per_head_to_fp8(
 // ---------------------------------------------------------------------------
 template cudaError_t cosmos_layernorm_modulate<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const cutlass::bfloat16_t*,
+    const cutlass::bfloat16_t*,
     cutlass::bfloat16_t*, int, int, int, float, cudaStream_t);
 template cudaError_t cosmos_layernorm_modulate<cutlass::half_t>(
     const cutlass::half_t*, const cutlass::half_t*, const cutlass::half_t*,
+    const cutlass::half_t*,
     cutlass::half_t*, int, int, int, float, cudaStream_t);
 
 template cudaError_t cosmos_layernorm_modulate_to_fp8<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const cutlass::bfloat16_t*,
+    const cutlass::bfloat16_t*,
     cutlass::bfloat16_t*, cutlass::float_e4m3_t*, int, int, int, float, cudaStream_t);
 template cudaError_t cosmos_layernorm_modulate_to_fp8<cutlass::half_t>(
     const cutlass::half_t*, const cutlass::half_t*, const cutlass::half_t*,
+    const cutlass::half_t*,
     cutlass::half_t*, cutlass::float_e4m3_t*, int, int, int, float, cudaStream_t);
 
 template cudaError_t cosmos_layernorm_modulate_to_fp8_only<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const cutlass::bfloat16_t*,
+    const cutlass::bfloat16_t*,
     cutlass::float_e4m3_t*, int, int, int, float, cudaStream_t);
 template cudaError_t cosmos_layernorm_modulate_to_fp8_only<cutlass::half_t>(
     const cutlass::half_t*, const cutlass::half_t*, const cutlass::half_t*,
+    const cutlass::half_t*,
     cutlass::float_e4m3_t*, int, int, int, float, cudaStream_t);
 
 template cudaError_t cosmos_col_scale_residual_layernorm_modulate_to_fp8_only<cutlass::bfloat16_t>(

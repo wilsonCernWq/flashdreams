@@ -65,6 +65,17 @@ void bind_optimized_dit(py::module_& module) {
     return false;
 #endif
   }, py::arg("device") = -1);
+  module.def("cosmos_test_layernorm_modulate", &::cosmos_test_layernorm_modulate,
+      py::arg("x"), py::arg("shift"), py::arg("scale"),
+      py::arg("cam") = py::none(), py::arg("B") = 1,
+      py::arg("variant") = "plain");
+  // Hard capability gate, not a convenience. Unknown config keys are silently
+  // ignored, so a newer Python layer against a stale prebuilt extension would
+  // send cosmos_cam_embed, have it dropped, and render camera-blind video with
+  // no error. Unlike hdmap -- which degrades to a bridge-side projection --
+  // camera has no fallback: it must be injected inside every block. Callers
+  // must treat a missing attribute as "refuse", never as "try anyway".
+  module.def("optimized_dit_supports_camera", []() { return true; });
   module.def("optimized_dit_supports_block_mod_cache", []() { return true; });
   module.def("optimized_dit_supports_hdmap_cache", []() { return true; });
 }

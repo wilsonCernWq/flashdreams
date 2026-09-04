@@ -837,6 +837,12 @@ class OptimizedDiTExecutor:
         self._optimized_empty_hdmap_cache: dict[tuple[Any, ...], Tensor] = {}
         self._optimized_kv_tensor_lists: dict[int, _CosmosCacheTensorLists] = {}
         self._optimized_runtime_config_id: int | None = None
+        # Optional per-block camera conditioning, filled by a model that has it
+        # (CMD) via ensure_camera_buffer(). Deliberately not a cache dict: the
+        # buffer's *address* is what the CUDA graph captures, so it is allocated
+        # once per rollout and written in place, never replaced.
+        self._camera_buffer: Tensor | None = None
+        self._camera_fill_key: tuple[Any, ...] | None = None
         self._optimized_last_ar_idx: int | None = None
         self._optimized_scheduler_call_idx = 0
         self._optimized_scheduler_timestep_keys: dict[int, tuple[Any, ...]] = {}
@@ -1067,6 +1073,13 @@ class OptimizedDiTExecutor:
         self._optimized_hdmap_cache.clear()
         self._optimized_empty_hdmap_cache.clear()
         self._optimized_kv_tensor_lists.clear()
+        # The camera buffer may only be dropped where the CUDA graph is also
+        # reset -- which is here, a few lines below. Never clear it from
+        # _clear_transient_ar_caches: that runs per AR chunk and would change
+        # the address the graph captured.
+        self._camera_buffer = None
+        self._camera_fill_key = None
+        self._optimized_streaming_config.pop("cosmos_cam_embed", None)
         self._optimized_runtime_config_id = None
         self._optimized_last_ar_idx = None
         self._optimized_scheduler_call_idx = 0
@@ -1630,8 +1643,83 @@ class OptimizedDiTExecutor:
         self._optimized_streaming_config.update(runtime_cfg)
         self._optimized_runtime_config_id = cfg_id
 
+    def supports_camera(self) -> bool:
+        """Whether the loaded extension can consume ``cosmos_cam_embed``.
+
+        Fail-closed: an extension built before camera support silently ignores
+        the config key and would render camera-blind output, so a missing
+        capability must be treated as "refuse", never as "try anyway".
+        """
+        extension = self._native_extension
+        probe = getattr(extension, "optimized_dit_supports_camera", None)
+        return bool(probe()) if callable(probe) else False
+
+    def ensure_camera_buffer(
+        self,
+        *,
+        num_blocks: int,
+        batch: int,
+        tokens: int,
+        channels: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Return the per-block camera buffer, allocating it once per rollout.
+
+        The caller fills it **in place** -- typically one ``torch.mm`` per block
+        writing ``cam_encoder(camera)`` into ``buffer[i, b]`` -- and must not
+        replace it. ``optimized_dit_forward`` receives this tensor through the
+        config dict, which ``CUDAGraphWrapper`` does not stage, so the graph
+        captures its *address*: handing back a freshly allocated tensor on the
+        next AR chunk would leave the graph reading the previous one. That
+        failure is silent, because the caching allocator usually returns the
+        same block, so it looks like the camera simply stopped moving.
+
+        The buffer is released only in ``after_initialize_autoregressive_cache``,
+        which resets the CUDA graph in the same breath, so buffer identity and
+        graph validity always move together.
+        """
+        if not self.supports_camera():
+            raise RuntimeError(
+                "the loaded omnidreams extension has no "
+                "optimized_dit_supports_camera probe; rebuild the native "
+                "extension before enabling camera conditioning"
+            )
+        shape = (num_blocks, batch, tokens, channels)
+        buffer = self._camera_buffer
+        if (
+            buffer is None
+            or tuple(buffer.shape) != shape
+            or buffer.device != device
+            or buffer.dtype != dtype
+        ):
+            buffer = torch.empty(shape, device=device, dtype=dtype)
+            self._camera_buffer = buffer
+            self._camera_fill_key = None
+            self._optimized_streaming_config["cosmos_cam_embed"] = buffer
+        return buffer
+
+    def camera_fill_needed(self, key: tuple[Any, ...]) -> bool:
+        """Whether the camera buffer still needs filling for ``key``.
+
+        ``key`` should include the AR index, so the four scheduler steps within
+        one chunk refill at most once. Do not key on the camera tensor's
+        ``data_ptr``: patchify produces a fresh tensor per call whose address the
+        allocator recycles.
+        """
+        if self._camera_fill_key == key:
+            return False
+        self._camera_fill_key = key
+        return True
+
     def _clear_transient_ar_caches(self) -> None:
-        """Drop per-AR-step tensors that are only useful within one step."""
+        """Drop per-AR-step tensors that are only useful within one step.
+
+        Note the camera buffer is deliberately absent: this runs per AR chunk,
+        and dropping the buffer would change the address the CUDA graph captured.
+        Only its fill key is per-chunk state, and that lives in
+        ``camera_fill_needed``.
+        """
         self._optimized_rope_cache.clear()
         self._optimized_rope_freqs_cache.clear()
         self._optimized_hdmap_cache.clear()
