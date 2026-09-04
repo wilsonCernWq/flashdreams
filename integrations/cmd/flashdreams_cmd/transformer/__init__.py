@@ -207,11 +207,34 @@ class CMDTransformer(CosmosTransformer):
             attention_backend=self.config.native_dit_attention_backend,
         )
 
+    @property
+    def _fp8_shape_stub_active(self) -> bool:
+        """True once the FP8 path has swapped the network for the shape stub.
+
+        ``fp8_kvcache_cudnn`` frees the PyTorch DiT after snapshotting weights
+        and installs ``_CosmosNetworkShapeOps`` (``optimized_dit.py:1126``).
+        The stub speaks omnidreams' batched tensor layouts; the real network
+        speaks CMD's. Both patchify directions have to know which is resident.
+        """
+        executor = self._optimized_dit_executor
+        return executor is not None and executor._released_network_for_fp8
+
     def patchify_and_maybe_split_cp(self, x: Tensor) -> Tensor:
         """Patchify latents or flatten pre-patchified camera tokens."""
         camera_dim = self.config.network.camera_dim
         if camera_dim is None or x.shape[-3] != camera_dim:
-            return super().patchify_and_maybe_split_cp(x)
+            if not self._fp8_shape_stub_active:
+                return super().patchify_and_maybe_split_cp(x)
+            # The stub wants 6D [B, V, T, C, H, W]; with flatten_thw its
+            # rearrangement is CMD's, so only the leading dims are added here.
+            batch_shape = tuple(x.shape[:-4])
+            tokens = self.network.patchify_and_maybe_split_cp(
+                x.reshape(1, 1, *x.shape[-4:]),
+                process_groups=[self._cp_group],
+                cp_dims=[-2],
+                flatten_thw=True,
+            )
+            return tokens.reshape(*batch_shape, *tokens.shape[2:])
 
         camera = rearrange(x, "... t c h w -> ... (t h w) c")
         if self._cp_group is not None:
@@ -312,8 +335,7 @@ class CMDTransformer(CosmosTransformer):
         implementation is already correct there -- which is why this surfaced
         only once FP8 ran, three failures after the layout work looked done.
         """
-        executor = self._optimized_dit_executor
-        if executor is None or not executor._released_network_for_fp8:
+        if not self._fp8_shape_stub_active:
             return super().unpatchify_and_maybe_gather_cp(x)
 
         assert self._output_height is not None and self._output_width is not None, (

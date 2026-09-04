@@ -40,6 +40,24 @@ class CMDDiTNetworkConfig(CosmosDiTNetworkConfig):
     camera_dim: int | None = None
     """Patch-flattened ray channels; ``None`` disables camera conditioning."""
 
+    @property
+    def patch_temporal(self) -> int:
+        """omnidreams names the patch dims individually; Cosmos packs them.
+
+        ``_CosmosNetworkShapeOps`` (``optimized_dit.py:585``) is constructed
+        from the *network* config and reads these two names directly. Derived
+        rather than stored so they cannot drift from ``patch_size``.
+        """
+        return int(self.patch_size[0])
+
+    @property
+    def patch_spatial(self) -> int:
+        patch_h, patch_w = self.patch_size[1], self.patch_size[2]
+        assert patch_h == patch_w, (
+            f"the native path assumes square spatial patches; got {patch_h}x{patch_w}"
+        )
+        return int(patch_h)
+
 
 class CMDDiTNetwork(CosmosDiTNetwork):
     """Run CMD's causal Cosmos DiT with optional camera control."""
