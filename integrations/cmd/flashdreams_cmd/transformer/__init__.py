@@ -297,6 +297,43 @@ class CMDTransformer(CosmosTransformer):
             spatial_positions=spatial_positions,
         )
 
+    def unpatchify_and_maybe_gather_cp(self, x: Tensor) -> Tensor:
+        """Bridge the shape stub the FP8 path installs over the released network.
+
+        Under ``fp8_kvcache_cudnn`` the executor frees the PyTorch DiT once the
+        weights are snapshotted and puts ``_CosmosNetworkShapeOps`` into
+        ``self.network`` (``optimized_dit.py:1126``) to reclaim several GiB.
+        That stub speaks omnidreams' batched signature -- 4D ``[B, V, L, D]``
+        with ``flatten_thw=True`` -- where CMD's network takes ``[..., L, D]``.
+        With that flag the two rearrangement patterns are identical; only the
+        leading dimensions differ.
+
+        bf16 never reaches this. It keeps the real network, so the base
+        implementation is already correct there -- which is why this surfaced
+        only once FP8 ran, three failures after the layout work looked done.
+        """
+        executor = self._optimized_dit_executor
+        if executor is None or not executor._released_network_for_fp8:
+            return super().unpatchify_and_maybe_gather_cp(x)
+
+        assert self._output_height is not None and self._output_width is not None, (
+            "unpatchify_and_maybe_gather_cp requires an initialized rollout; "
+            "call initialize_autoregressive_cache(..., height=..., width=...) first."
+        )
+        _, kh, kw = self.config.network.patch_size
+        batch_shape = tuple(x.shape[:-2])
+        # reshape (not view) so a batch that is not 1 fails here rather than
+        # silently folding views together downstream.
+        video = self.network.unpatchify_and_maybe_gather_cp(
+            pH=self._output_height // kh,
+            pW=self._output_width // kw,
+            x=x.reshape(1, 1, x.shape[-2], x.shape[-1]),
+            process_groups=[self._cp_group],
+            cp_dims=[-2],
+            flatten_thw=True,
+        )
+        return video.reshape(*batch_shape, *video.shape[2:])
+
     def finalize_kv_cache(self, *args: Any, **kwargs: Any) -> None:
         try:
             super().finalize_kv_cache(*args, **kwargs)
