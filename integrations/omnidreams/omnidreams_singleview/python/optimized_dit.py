@@ -633,6 +633,43 @@ def _seq_slice(ndim: int, seq_dim: int, start: int, end: int) -> tuple[slice, ..
     return tuple(idx)
 
 
+def _seed_fp8_self_caches(
+    tensors: list[Tensor],
+    cache: CosmosTransformerCache,
+) -> list[Tensor]:
+    """Build the FP8 shadow self-KV caches, carrying over what is already cached.
+
+    These shadow buffers mirror the PyTorch block caches in FP8. omnidreams
+    reaches here with an empty self-KV cache -- nothing has been generated yet --
+    so allocating them zeroed was equivalent to seeding them. A model that
+    prefills conditioning into the self-KV cache *before* AR step 0 has real K/V
+    resident at this point, and zeroing discarded it: the rollout then attended
+    over zeros wherever the prefix should be and degenerated within a few AR
+    steps, with no error. CMD writes a clean first-frame prefix and hit exactly
+    that.
+
+    Only ``[0, _n_cached)`` is carried over. Slots past the write cursor are
+    allocated but never written, so quantizing them would convert uninitialized
+    memory -- observed as NaN in a live cache. Attention masks them out either
+    way; zeroing keeps the buffer's contents defined rather than relying on it.
+
+    With ``_n_cached == 0`` this reproduces the previous all-zero buffers
+    exactly, so omnidreams' behaviour is unchanged.
+    """
+    seeded: list[Tensor] = []
+    for tensor, block in zip(tensors, cache.network_cache.block_caches, strict=True):
+        shadow = torch.zeros_like(tensor, dtype=torch.uint8)
+        self_attn = block.self_attn
+        n_cached = int(self_attn._n_cached or 0)
+        if n_cached > 0:
+            idx = _seq_slice(tensor.ndim, self_attn.seq_dim, 0, n_cached)
+            shadow[idx] = (
+                tensor[idx].to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
+            )
+        seeded.append(shadow)
+    return seeded
+
+
 def _roll_fp8_cache_left_like_block_cache(
     tensor: Tensor,
     block_cache: Any,
@@ -1258,8 +1295,8 @@ class OptimizedDiTExecutor:
             k_cross_sage3_sf = []
             v_cross_sage3_sf = []
 
-        k_self_fp8 = [torch.zeros_like(t, dtype=torch.uint8) for t in k_self]
-        v_self_fp8 = [torch.zeros_like(t, dtype=torch.uint8) for t in v_self]
+        k_self_fp8 = _seed_fp8_self_caches(k_self, cache)
+        v_self_fp8 = _seed_fp8_self_caches(v_self, cache)
         cfg.update(
             {
                 "k_cross_fp8_caches": k_cross_fp8,
