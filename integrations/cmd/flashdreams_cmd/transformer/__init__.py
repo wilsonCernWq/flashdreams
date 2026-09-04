@@ -207,11 +207,34 @@ class CMDTransformer(CosmosTransformer):
             attention_backend=self.config.native_dit_attention_backend,
         )
 
+    @property
+    def _fp8_shape_stub_active(self) -> bool:
+        """True once the FP8 path has swapped the network for the shape stub.
+
+        ``fp8_kvcache_cudnn`` frees the PyTorch DiT after snapshotting weights
+        and installs ``_CosmosNetworkShapeOps`` (``optimized_dit.py:1126``).
+        The stub speaks omnidreams' batched tensor layouts; the real network
+        speaks CMD's. Both patchify directions have to know which is resident.
+        """
+        executor = self._optimized_dit_executor
+        return executor is not None and executor._released_network_for_fp8
+
     def patchify_and_maybe_split_cp(self, x: Tensor) -> Tensor:
         """Patchify latents or flatten pre-patchified camera tokens."""
         camera_dim = self.config.network.camera_dim
         if camera_dim is None or x.shape[-3] != camera_dim:
-            return super().patchify_and_maybe_split_cp(x)
+            if not self._fp8_shape_stub_active:
+                return super().patchify_and_maybe_split_cp(x)
+            # The stub wants 6D [B, V, T, C, H, W]; with flatten_thw its
+            # rearrangement is CMD's, so only the leading dims are added here.
+            batch_shape = tuple(x.shape[:-4])
+            tokens = self.network.patchify_and_maybe_split_cp(
+                x.reshape(1, 1, *x.shape[-4:]),
+                process_groups=[self._cp_group],
+                cp_dims=[-2],
+                flatten_thw=True,
+            )
+            return tokens.reshape(*batch_shape, *tokens.shape[2:])
 
         camera = rearrange(x, "... t c h w -> ... (t h w) c")
         if self._cp_group is not None:
@@ -296,6 +319,42 @@ class CMDTransformer(CosmosTransformer):
             temporal_positions=temporal_positions,
             spatial_positions=spatial_positions,
         )
+
+    def unpatchify_and_maybe_gather_cp(self, x: Tensor) -> Tensor:
+        """Bridge the shape stub the FP8 path installs over the released network.
+
+        Under ``fp8_kvcache_cudnn`` the executor frees the PyTorch DiT once the
+        weights are snapshotted and puts ``_CosmosNetworkShapeOps`` into
+        ``self.network`` (``optimized_dit.py:1126``) to reclaim several GiB.
+        That stub speaks omnidreams' batched signature -- 4D ``[B, V, L, D]``
+        with ``flatten_thw=True`` -- where CMD's network takes ``[..., L, D]``.
+        With that flag the two rearrangement patterns are identical; only the
+        leading dimensions differ.
+
+        bf16 never reaches this. It keeps the real network, so the base
+        implementation is already correct there -- which is why this surfaced
+        only once FP8 ran, three failures after the layout work looked done.
+        """
+        if not self._fp8_shape_stub_active:
+            return super().unpatchify_and_maybe_gather_cp(x)
+
+        assert self._output_height is not None and self._output_width is not None, (
+            "unpatchify_and_maybe_gather_cp requires an initialized rollout; "
+            "call initialize_autoregressive_cache(..., height=..., width=...) first."
+        )
+        _, kh, kw = self.config.network.patch_size
+        batch_shape = tuple(x.shape[:-2])
+        # reshape (not view) so a batch that is not 1 fails here rather than
+        # silently folding views together downstream.
+        video = self.network.unpatchify_and_maybe_gather_cp(
+            pH=self._output_height // kh,
+            pW=self._output_width // kw,
+            x=x.reshape(1, 1, x.shape[-2], x.shape[-1]),
+            process_groups=[self._cp_group],
+            cp_dims=[-2],
+            flatten_thw=True,
+        )
+        return video.reshape(*batch_shape, *video.shape[2:])
 
     def finalize_kv_cache(self, *args: Any, **kwargs: Any) -> None:
         try:
