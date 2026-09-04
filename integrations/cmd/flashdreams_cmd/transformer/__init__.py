@@ -35,6 +35,7 @@ from flashdreams.recipes.cosmos.transformer.impl.network import (
     state_dict_transform,
 )
 
+from . import native_adapter
 from .network import CMDDiTNetwork, CMDDiTNetworkConfig
 
 __all__ = [
@@ -76,12 +77,135 @@ class CMDTransformerConfig(CosmosTransformerConfig):
     prefix_len_t: int = 1
     """Independent I2V prefix length. Released CMD checkpoints use ``1``."""
 
+    ## Native DiT acceleration
+    #
+    # CMD borrows omnidreams' `omnidreams_singleview` extension rather than
+    # carrying its own kernels: the two models emit byte-identical per-block
+    # state-dict keys, so the same C++ bridge consumes both. These mirror the
+    # fields omnidreams exposes, because they are forwarded verbatim to the
+    # shared OptimizedDiTExecutor.
+
+    native_dit_acceleration: str = "disabled"
+    """``disabled``, ``auto`` (fall back silently), or ``required`` (raise)."""
+
+    native_dit_backend: str = "fp8_kvcache_cudnn"
+    """``fp8_kvcache_cudnn`` or ``bf16``. Only meaningful when enabled."""
+
+    native_dit_attention_backend: str = "auto"
+    """``auto``, ``cudnn``, ``sparge``, ``sage3`` or ``sage3_fp8``."""
+
+    native_dit_build_root: str | None = None
+    """Where to cache the JIT-built extension; ``None`` uses the default."""
+
+    native_dit_max_jobs: int | str | None = None
+    """nvcc fan-out. Keep small (2) on a shared host: the build is RAM-bound."""
+
+    native_dit_verbose_build: bool = False
+    """Echo nvcc lines, for diagnosing a build that fails to load."""
+
+    ## Executor contract
+    #
+    # OptimizedDiTExecutor reads exactly nine config fields. Six CMD already
+    # has; these three live on `network` here but at the top level in
+    # omnidreams' config, so they are forwarded rather than duplicated -- a
+    # second copy could drift from `network.patch_size` and would surface as a
+    # wrong token grid deep inside a kernel.
+
+    @property
+    def num_views(self) -> int:
+        """CMD is single-view; omnidreams' config carries this for multi-camera.
+
+        The executor reads it only to refuse ``> 1`` -- ``optimized_dit_forward``
+        has no cross-view attention. Returning the constant states that plainly
+        rather than leaving an AttributeError several frames into setup.
+        """
+        return 1
+
+    @property
+    def num_heads(self) -> int:
+        return int(self.network.num_heads)
+
+    @property
+    def patch_temporal(self) -> int:
+        return native_adapter.resolve_patch_dims(self.network)[0]
+
+    @property
+    def patch_spatial(self) -> int:
+        return native_adapter.resolve_patch_dims(self.network)[1]
+
 
 class CMDTransformer(CosmosTransformer):
     """Run CMD generation after seeding the clean first-frame prefix."""
 
     config: CMDTransformerConfig
     network: CMDDiTNetwork
+
+    def __init__(self, config: CMDTransformerConfig) -> None:
+        native_enabled = config.native_dit_acceleration != "disabled"
+        if native_enabled and config.compile_network:
+            # The base __init__ wraps self.network in compile_module before we
+            # get a chance to build the executor, and the executor snapshots the
+            # module's weights. Rather than reorder the base or mutate config
+            # behind its back, refuse the combination -- it is already the
+            # documented requirement for the native path, and running both costs
+            # a torch.compile graph that is then thrown away.
+            raise ValueError(
+                "native_dit_acceleration requires compile_network=False; "
+                "pass --pipeline.diffusion-model.transformer.compile-network False"
+            )
+        super().__init__(config)
+
+        self._optimized_dit_executor: Any | None = None
+        self._optimized_dit_selection: Any | None = None
+        # (temporal_positions, spatial_positions) for the current rollout;
+        # resolved in initialize_autoregressive_cache, where height/width are
+        # first known.
+        self._native_grid: tuple[int, int] | None = None
+        if native_enabled:
+            self._configure_optimized_dit_from_config()
+
+    def _configure_optimized_dit_from_config(self) -> None:
+        """Build the shared omnidreams executor for CMD's network.
+
+        Imported here rather than at module scope so ``import flashdreams_cmd``
+        never requires the omnidreams package; only actually enabling the native
+        path does. The kernels, the C++ bridge and the executor all live in
+        omnidreams_singleview -- CMD supplies tensors in the bridge's layout and
+        nothing else.
+        """
+        try:
+            from omnidreams.native import omnidreams_singleview
+            from omnidreams.native.acceleration import (
+                NativeAccelerationConfig,
+                require_extension_symbols,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "native_dit_acceleration requires the omnidreams package "
+                "(flashdreams-omnidreams) to be installed"
+            ) from exc
+
+        helper = omnidreams_singleview.load_python_module("optimized_dit")
+        selection = omnidreams_singleview.select_backend(
+            "optimized_dit",
+            NativeAccelerationConfig(
+                mode=self.config.native_dit_acceleration,
+                build_root=self.config.native_dit_build_root,
+                max_jobs=self.config.native_dit_max_jobs,
+                verbose_build=self.config.native_dit_verbose_build,
+            ),
+            availability_check=require_extension_symbols("optimized_dit_forward"),
+        )
+        self._optimized_dit_selection = selection
+        if not selection.enabled:
+            # "auto" degrades silently by design; "required" already raised.
+            return
+        self._optimized_dit_executor = helper.OptimizedDiTExecutor(
+            self,
+            selection.require_extension(),
+            dit_backend=self.config.native_dit_backend,
+            attention_backend=self.config.native_dit_attention_backend,
+        )
 
     def patchify_and_maybe_split_cp(self, x: Tensor) -> Tensor:
         """Patchify latents or flatten pre-patchified camera tokens."""
@@ -93,6 +217,95 @@ class CMDTransformer(CosmosTransformer):
         if self._cp_group is not None:
             camera = split_inputs_cp(camera, seq_dim=-2, cp_group=self._cp_group)
         return camera
+
+    def predict_flow(
+        self,
+        noisy_latent: Tensor,
+        timestep: Tensor,
+        cache: CosmosTransformerCache,
+        input: Tensor | None = None,
+    ) -> Tensor:
+        """Route to the native executor when one is configured.
+
+        **``input`` means different things in the two models.** omnidreams
+        passes an HDMap here and the executor forwards it as ``hdmap_patched``;
+        CMD passes *camera* tokens (see ``_predict_flow``, ``camera=input``).
+        Handing CMD's camera straight to the executor would feed it to the HDMap
+        branch -- accepted without complaint, and wrong. So camera is
+        intercepted here and an explicitly empty HDMap goes down instead.
+        """
+        executor = self._optimized_dit_executor
+        if executor is None:
+            return super().predict_flow(
+                noisy_latent=noisy_latent,
+                timestep=timestep,
+                cache=cache,
+                input=input,
+            )
+        if self.config.network.camera_dim is not None:
+            raise NotImplementedError(
+                "camera-conditioned CMD on the native path needs the camera "
+                "producer, which is not wired up yet; the kernels and transport "
+                "are in place (dev/camera-inject-f62a0d) but nothing fills the "
+                "buffer. Use a camera-free preset for now."
+            )
+        if input is not None:
+            raise ValueError(
+                "a camera tensor was supplied to a CMD model with "
+                "camera_dim=None; the native path has nowhere to put it"
+            )
+        grid = self._native_grid
+        if grid is None:
+            raise RuntimeError(
+                "predict_flow reached the native path before "
+                "initialize_autoregressive_cache resolved the latent grid"
+            )
+        temporal_positions, spatial_positions = grid
+        bridge_latent = native_adapter.to_bridge_latent(
+            noisy_latent,
+            temporal_positions=temporal_positions,
+            spatial_positions=spatial_positions,
+        )
+        flow = executor.predict_flow(
+            noisy_latent=bridge_latent,
+            timestep=timestep,
+            cache=cache,
+            input=native_adapter.empty_hdmap_like(bridge_latent),
+        )
+        return native_adapter.from_bridge_latent(
+            flow, batch_shape=tuple(noisy_latent.shape[:-2])
+        )
+
+    def _select_mask(self, cache: CosmosTransformerCache) -> Tensor:
+        """The mask follows the latent's layout, so it needs the same translation.
+
+        The executor calls back into this method
+        (``optimized_dit.py:832-833``) and forwards the result straight to
+        ``condition_mask_patched``, which the bridge validates as 5D. omnidreams'
+        cache already holds that shape; CMD's holds ``[..., L, D]``. Translating
+        here rather than at the call site keeps the eager path untouched --
+        ``_predict_flow`` concatenates the mask onto the latent and wants CMD's
+        own layout.
+        """
+        mask = super()._select_mask(cache)
+        if self._optimized_dit_executor is None or self._native_grid is None:
+            return mask
+        temporal_positions, spatial_positions = self._native_grid
+        return native_adapter.to_bridge_latent(
+            mask,
+            temporal_positions=temporal_positions,
+            spatial_positions=spatial_positions,
+        )
+
+    def finalize_kv_cache(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            super().finalize_kv_cache(*args, **kwargs)
+        finally:
+            if self._optimized_dit_executor is not None:
+                # Runs even when skip_finalize_kv_cache short-circuits the base:
+                # the executor's per-chunk caches are keyed on the AR index and
+                # must be dropped either way.
+                self._optimized_dit_executor.after_finalize_kv_cache()
 
     def _predict_flow(
         self,
@@ -212,4 +425,20 @@ class CMDTransformer(CosmosTransformer):
                 rope_freqs=prefix_freqs,
                 camera=camera_prefix,
             )
+        if self._optimized_dit_executor is not None:
+            # The bridge wants [B, V, T, HW, D]; CMD carries [..., L, D]. The
+            # split of L into (T, HW) depends on the rollout's height/width,
+            # which is only known here, so it is resolved once and kept for
+            # predict_flow rather than re-derived per scheduler step.
+            self._native_grid = native_adapter.latent_grid(
+                self.config, height=height, width=width
+            )
+            # Must run after prefill: the executor snapshots the cache templates
+            # here, and it resets the CUDA graph in the same call, so anything
+            # allocated per rollout is released in lockstep with the graph.
+            #
+            # Note prefill itself stays on the eager network. It runs once per
+            # rollout at a different token count than the streaming steps, so
+            # routing it natively would be a separate piece of work.
+            self._optimized_dit_executor.after_initialize_autoregressive_cache(cache)
         return cache
