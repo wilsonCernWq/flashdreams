@@ -161,6 +161,7 @@ class CMDTransformer(CosmosTransformer):
         # resolved in initialize_autoregressive_cache, where height/width are
         # first known.
         self._native_grid: tuple[int, int] | None = None
+        self._cam_encoder_snapshot: list[Tensor] | None = None
         if native_enabled:
             self._configure_optimized_dit_from_config()
 
@@ -265,18 +266,20 @@ class CMDTransformer(CosmosTransformer):
                 cache=cache,
                 input=input,
             )
-        if self.config.network.camera_dim is not None:
-            raise NotImplementedError(
-                "camera-conditioned CMD on the native path needs the camera "
-                "producer, which is not wired up yet; the kernels and transport "
-                "are in place (dev/camera-inject-f62a0d) but nothing fills the "
-                "buffer. Use a camera-free preset for now."
-            )
-        if input is not None:
+        camera_dim = self.config.network.camera_dim
+        if camera_dim is None and input is not None:
             raise ValueError(
                 "a camera tensor was supplied to a CMD model with "
                 "camera_dim=None; the native path has nowhere to put it"
             )
+        if camera_dim is not None:
+            if input is None:
+                raise ValueError(
+                    "a camera-conditioned CMD model reached the native path "
+                    "without camera tokens; the forward would silently drop "
+                    "camera conditioning"
+                )
+            self._fill_camera_buffer(input, cache=cache)
         grid = self._native_grid
         if grid is None:
             raise RuntimeError(
@@ -298,6 +301,69 @@ class CMDTransformer(CosmosTransformer):
         return native_adapter.from_bridge_latent(
             flow, batch_shape=tuple(noisy_latent.shape[:-2])
         )
+
+    def _camera_encoder_weights(self) -> list[Tensor]:
+        """Snapshot every block's ``cam_encoder`` weight, once per rollout.
+
+        Taken eagerly rather than read per call because the FP8 path *frees the
+        network*: after ``_released_network_for_fp8`` the blocks are gone and
+        ``self.network`` is a shape stub. 28 x [2048, 1536] bf16 is ~176 MiB,
+        the same tensors the network already held, so this costs nothing while
+        the network is alive and keeps working after it is released.
+        """
+        if self._cam_encoder_snapshot is not None:
+            return self._cam_encoder_snapshot
+        weights = [
+            block.self_attn.cam_encoder.weight.detach()
+            for block in self.network.blocks
+        ]
+        if not weights:
+            raise RuntimeError("no transformer blocks to take cam_encoder from")
+        self._cam_encoder_snapshot = weights
+        return weights
+
+    def _fill_camera_buffer(self, camera: Tensor, *, cache: Any) -> None:
+        """Write ``cam_encoder(camera)`` for every block into the shared buffer.
+
+        The kernel adds this per token after each block's self-attention
+        LayerNorm+AdaLN. ``cam_encoder`` never sees ``x``, so the whole term is
+        precomputable once per AR chunk rather than once per scheduler step --
+        one ``torch.mm`` per block, written *in place* into a buffer whose
+        address the CUDA graph captured. Replacing the buffer instead of filling
+        it would leave the graph reading a freed allocation, which the caching
+        allocator usually re-hands out: camera-frozen video, no error.
+        """
+        executor = self._optimized_dit_executor
+        assert executor is not None
+        if not executor.supports_camera():
+            raise RuntimeError(
+                "the loaded omnidreams extension has no camera support, so "
+                "cosmos_cam_embed would be ignored and the forward would render "
+                "camera-blind video; rebuild the native extension"
+            )
+        weights = self._camera_encoder_weights()
+        # One fill per AR chunk: the scheduler runs predict_flow several times
+        # per chunk against the same camera. Keyed on the AR index rather than
+        # the tensor's address, which the allocator recycles.
+        key = (int(cache.autoregressive_index),)
+        if not executor.camera_fill_needed(key):
+            return
+        tokens, channels = int(camera.shape[-2]), int(weights[0].shape[0])
+        flat = camera.reshape(-1, int(camera.shape[-1]))
+        buffer = executor.ensure_camera_buffer(
+            num_blocks=len(weights),
+            batch=1,
+            tokens=tokens,
+            channels=channels,
+            device=flat.device,
+            dtype=weights[0].dtype,
+        )
+        for index, weight in enumerate(weights):
+            torch.mm(
+                flat.to(dtype=weight.dtype),
+                weight.t(),
+                out=buffer[index, 0].view(tokens, channels),
+            )
 
     def _select_mask(self, cache: CosmosTransformerCache) -> Tensor:
         """The mask follows the latent's layout, so it needs the same translation.

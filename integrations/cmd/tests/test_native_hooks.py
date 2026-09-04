@@ -49,6 +49,9 @@ class _StubExecutor:
         self.predict_calls: list[dict[str, Any]] = []
         self.after_init_calls = 0
         self.after_finalize_calls = 0
+        self.camera_buffer: torch.Tensor | None = None
+        self.ensure_calls = 0
+        self._camera_key: Any = None
 
     def predict_flow(self, **kwargs: Any) -> torch.Tensor:
         self.predict_calls.append(kwargs)
@@ -62,6 +65,27 @@ class _StubExecutor:
 
     def after_finalize_kv_cache(self) -> None:
         self.after_finalize_calls += 1
+
+    # --- camera transport ---
+    def supports_camera(self) -> bool:
+        return True
+
+    def camera_fill_needed(self, key: Any) -> bool:
+        if self._camera_key == key:
+            return False
+        self._camera_key = key
+        return True
+
+    def ensure_camera_buffer(self, **kwargs: Any) -> torch.Tensor:
+        self.ensure_calls += 1
+        return self.camera_buffer
+
+
+class _StubCache:
+    """Only the AR index matters to the hooks under test."""
+
+    def __init__(self, *, ar_index: int) -> None:
+        self.autoregressive_index = ar_index
 
 
 def _transformer_with(executor: Any, *, camera_dim: int | None = None) -> CMDTransformer:
@@ -220,21 +244,72 @@ def test_a_camera_tensor_on_a_camera_free_model_is_refused() -> None:
         )
 
 
-def test_camera_conditioned_models_are_refused_for_now() -> None:
-    """The kernels and transport exist; the producer does not.
+def test_a_camera_model_without_camera_tokens_is_refused() -> None:
+    """The anti-silent-drop guard, from the other side.
 
-    This must stay a refusal until something fills the camera buffer, because
-    the alternative is camera-blind output with no error -- the exact failure
-    the whole camera track was built to prevent.
+    A camera-conditioned checkpoint reaching the native path with ``input=None``
+    has no camera to inject. The forward would succeed and render camera-blind
+    video -- the exact failure this whole track was built to prevent -- so it
+    must raise instead.
     """
     transformer = _transformer_with(_StubExecutor(), camera_dim=1536)
-    with pytest.raises(NotImplementedError, match="camera producer"):
+    with pytest.raises(ValueError, match="silently drop camera"):
         transformer.predict_flow(
             noisy_latent=torch.zeros(4, 8),
             timestep=torch.zeros(()),
             cache=object(),
             input=None,
         )
+
+
+def test_camera_buffer_is_filled_per_block_and_in_place() -> None:
+    """The producer writes cam_encoder(camera) for every block, without
+    replacing the buffer the CUDA graph captured."""
+    executor = _StubExecutor()
+    transformer = _transformer_with(executor, camera_dim=1536)
+    blocks, tokens, channels = 3, 4, 8
+    weights = [torch.full((channels, 1536), float(i + 1)) for i in range(blocks)]
+    transformer._cam_encoder_snapshot = weights
+    buffer = torch.zeros(blocks, 1, tokens, channels)
+    executor.camera_buffer = buffer
+
+    camera = torch.ones(tokens, 1536)
+    transformer.predict_flow(
+        noisy_latent=torch.zeros(tokens, channels),
+        timestep=torch.zeros(()),
+        cache=_StubCache(ar_index=0),
+        input=camera,
+    )
+
+    assert executor.camera_buffer.data_ptr() == buffer.data_ptr(), (
+        "the buffer was replaced rather than filled; the CUDA graph would keep "
+        "reading the old allocation"
+    )
+    # Block i's weight is a constant (i+1), so each row sums to 1536 * (i+1).
+    for i in range(blocks):
+        assert torch.allclose(buffer[i, 0], torch.full((tokens, channels), 1536.0 * (i + 1))), (
+            f"block {i} did not receive its own cam_encoder projection"
+        )
+
+
+def test_camera_is_filled_once_per_ar_chunk() -> None:
+    """The scheduler calls predict_flow several times per AR chunk against the
+    same camera; refilling each time is 28 GEMMs of pure waste."""
+    executor = _StubExecutor()
+    transformer = _transformer_with(executor, camera_dim=1536)
+    transformer._cam_encoder_snapshot = [torch.zeros(8, 1536)]
+    executor.camera_buffer = torch.zeros(1, 1, 4, 8)
+
+    for _ in range(3):
+        transformer.predict_flow(
+            noisy_latent=torch.zeros(4, 8),
+            timestep=torch.zeros(()),
+            cache=_StubCache(ar_index=0),
+            input=torch.ones(4, 1536),
+        )
+    assert executor.ensure_calls == 1, (
+        f"the buffer was filled {executor.ensure_calls} times for one AR chunk"
+    )
 
 
 def test_finalize_hook_runs_even_when_the_base_short_circuits() -> None:
